@@ -257,9 +257,6 @@ impl EcmascriptChunkItemWithAsyncInfo {
 
 #[turbo_tasks::value_trait]
 pub trait EcmascriptChunkItem: ChunkItem + OutputAssetsReference {
-    #[turbo_tasks::function]
-    fn content(self: Vc<Self>) -> Vc<EcmascriptChunkItemContent>;
-
     /// Fetches the content of the chunk item with async module info.
     /// When `estimated` is true, it's ok to provide an estimated content, since it's only used for
     /// compute the chunking. When `estimated` is true, this function should not invoke other
@@ -267,11 +264,9 @@ pub trait EcmascriptChunkItem: ChunkItem + OutputAssetsReference {
     #[turbo_tasks::function]
     fn content_with_async_module_info(
         self: Vc<Self>,
-        _async_module_info: Option<Vc<AsyncModuleInfo>>,
-        _estimated: bool,
-    ) -> Vc<EcmascriptChunkItemContent> {
-        self.content()
-    }
+        async_module_info: Option<Vc<AsyncModuleInfo>>,
+        estimated: bool,
+    ) -> Vc<EcmascriptChunkItemContent>;
 }
 
 pub trait EcmascriptChunkItemExt {
@@ -372,7 +367,6 @@ impl ChunkItem for EcmascriptModuleChunkItem {
             .chunk_item_content_ident(*self.chunking_context, *self.module_graph)
     }
 
-    #[turbo_tasks::function]
     fn ty(&self) -> Vc<Box<dyn ChunkType>> {
         Vc::upcast(Vc::<EcmascriptChunkType>::default())
     }
@@ -382,7 +376,6 @@ impl ChunkItem for EcmascriptModuleChunkItem {
         Vc::upcast(*self.module)
     }
 
-    #[turbo_tasks::function]
     fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {
         *self.chunking_context
     }
@@ -399,12 +392,6 @@ impl OutputAssetsReference for EcmascriptModuleChunkItem {
 
 #[turbo_tasks::value_impl]
 impl EcmascriptChunkItem for EcmascriptModuleChunkItem {
-    #[turbo_tasks::function]
-    fn content(&self) -> Vc<EcmascriptChunkItemContent> {
-        self.module
-            .chunk_item_content(*self.chunking_context, *self.module_graph, None, false)
-    }
-
     #[turbo_tasks::function]
     fn content_with_async_module_info(
         &self,

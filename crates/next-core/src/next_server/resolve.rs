@@ -64,29 +64,25 @@ impl ExternalCjsModulesResolvePlugin {
     }
 }
 
-#[turbo_tasks::function]
-fn condition(root: FileSystemPath) -> Vc<AfterResolvePluginCondition> {
-    AfterResolvePluginCondition::new_with_glob(
-        root,
-        Glob::new(rcstr!("**/node_modules/**"), GlobOptions::default()),
-    )
-}
-
 #[turbo_tasks::value_impl]
 impl AfterResolvePlugin for ExternalCjsModulesResolvePlugin {
     #[turbo_tasks::function]
     fn after_resolve_condition(&self) -> Vc<AfterResolvePluginCondition> {
-        condition(self.root.clone())
+        AfterResolvePluginCondition::new_with_glob(
+            self.root.clone(),
+            Glob::new(rcstr!("**/node_modules/**"), GlobOptions::default()),
+        )
     }
 
     #[turbo_tasks::function]
     async fn after_resolve(
-        &self,
+        self: Vc<Self>,
         fs_path: FileSystemPath,
         lookup_path: FileSystemPath,
         reference_type: ReferenceType,
         request: ResolvedVc<Request>,
     ) -> Result<Vc<ResolveResultOption>> {
+        let this = self.await?;
         let request_value = &*request.await?;
         let Request::Module {
             module: package,
@@ -109,10 +105,11 @@ impl AfterResolvePlugin for ExternalCjsModulesResolvePlugin {
 
         let raw_fs_path = fs_path.clone();
 
-        let predicate = self.predicate.await?;
+        let predicate = this.predicate.await?;
         let must_be_external = match &*predicate {
             ExternalPredicate::AllExcept(exceptions) => {
-                if *condition(self.root.clone())
+                if *self
+                    .after_resolve_condition()
                     .matches(lookup_path.clone())
                     .await?
                 {
@@ -155,7 +152,7 @@ impl AfterResolvePlugin for ExternalCjsModulesResolvePlugin {
             }
         };
 
-        let is_esm = self.import_externals
+        let is_esm = this.import_externals
             && ReferenceTypeCondition::EcmaScriptModules(None).includes(&reference_type);
 
         #[derive(Debug, Copy, Clone)]
@@ -230,7 +227,7 @@ impl AfterResolvePlugin for ExternalCjsModulesResolvePlugin {
                 node_resolve_options,
             );
             let Some(result_from_original_location) =
-                *node_resolved_from_original_location.first_source().await?
+                node_resolved_from_original_location.await?.first_source()
             else {
                 if is_esm
                     && !package_subpath.is_empty()
@@ -287,7 +284,7 @@ impl AfterResolvePlugin for ExternalCjsModulesResolvePlugin {
                     request,
                     node_resolve_options,
                 );
-                let resolves_equal = if let Some(result) = *node_resolved.first_source().await? {
+                let resolves_equal = if let Some(result) = node_resolved.await?.first_source() {
                     let cjs_path = result.ident().path().owned().await?;
                     cjs_path == *path
                 } else {

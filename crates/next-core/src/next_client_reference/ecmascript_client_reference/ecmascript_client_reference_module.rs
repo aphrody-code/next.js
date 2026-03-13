@@ -317,12 +317,10 @@ impl ChunkItem for EcmascriptClientReferenceProxyChunkItem {
         self.inner_module.ident()
     }
 
-    #[turbo_tasks::function]
     fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {
         *self.chunking_context
     }
 
-    #[turbo_tasks::function]
     fn ty(&self) -> Vc<Box<dyn ChunkType>> {
         Vc::upcast(Vc::<EcmascriptChunkType>::default())
     }
@@ -335,11 +333,6 @@ impl ChunkItem for EcmascriptClientReferenceProxyChunkItem {
 
 #[turbo_tasks::value_impl]
 impl EcmascriptChunkItem for EcmascriptClientReferenceProxyChunkItem {
-    #[turbo_tasks::function]
-    fn content(&self) -> Vc<EcmascriptChunkItemContent> {
-        self.inner_chunk_item.content()
-    }
-
     #[turbo_tasks::function]
     fn content_with_async_module_info(
         &self,
