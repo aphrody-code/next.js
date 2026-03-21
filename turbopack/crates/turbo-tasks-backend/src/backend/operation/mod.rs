@@ -23,7 +23,7 @@ use turbo_tasks::{
     macro_helpers::NativeFunction,
 };
 
-use self::aggregation_update::ComputeDirtyAndCleanUpdate;
+pub use self::aggregation_update::ComputeDirtyAndCleanUpdate;
 use crate::{
     backend::{
         EventDescription, OperationGuard, TaskDataCategory, TurboTasksBackend,
@@ -561,6 +561,7 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
             if let Some(task_type) = entry.task_type.clone() {
                 // Insert into the task cache to avoid future lookups
                 self.backend
+                    .storage
                     .task_cache
                     .entry(task_type)
                     .or_insert(entry.task_id);
@@ -1048,6 +1049,7 @@ impl Display for TaskTypeRef<'_> {
     }
 }
 
+#[derive(Debug)]
 pub enum TaskType {
     Cached(Arc<CachedTaskType>),
     Transient(Arc<TransientTask>),
@@ -1346,12 +1348,12 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
     fn get_task_desc_fn(&self) -> impl Fn() -> String + Send + Sync + 'static {
         let task_type = self.get_task_type().to_owned();
         let task_id = self.id();
-        move || format!("{task_id:?} {task_type}")
+        move || format!("{task_id:?} {task_type:?}")
     }
     fn get_task_description(&self) -> String {
         let task_type = self.get_task_type().to_owned();
         let task_id = self.id();
-        format!("{task_id:?} {task_type}")
+        format!("{task_id:?} {task_type:?}")
     }
     fn get_task_name(&self) -> String {
         let task_type = self.get_task_type().to_owned();

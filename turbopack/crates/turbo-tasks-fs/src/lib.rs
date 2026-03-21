@@ -670,7 +670,9 @@ impl DiskFileSystem {
 
 #[turbo_tasks::value_impl]
 impl DiskFileSystem {
-    #[turbo_tasks::function]
+    /// The disk filesystem tracks transient information to implement the watcher, it is not safe to
+    /// evict this data during a dev session so we mark it session_stateful
+    #[turbo_tasks::function(session_stateful)]
     async fn new_internal(
         name: RcStr,
         root: Vc<RcStr>,

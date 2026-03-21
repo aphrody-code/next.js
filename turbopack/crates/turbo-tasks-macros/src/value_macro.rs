@@ -502,6 +502,7 @@ pub fn value_type_and_register(
             fn has_serialization() -> bool {
                 #has_serialization
             }
+
         }
     }
 }

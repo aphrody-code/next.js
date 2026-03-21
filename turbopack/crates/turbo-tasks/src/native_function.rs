@@ -215,6 +215,10 @@ pub struct NativeFunction {
     /// Whether this function's tasks should be treated as root nodes in the aggregation graph.
     /// Root tasks start with aggregation number `u32::MAX` on initial creation.
     pub is_root: bool,
+
+    /// Whether tasks of this function hold session-local state that cannot be reconstructed from
+    /// disk. When true, eviction is skipped for tasks of this function.
+    pub is_session_stateful: bool,
 }
 
 impl Debug for NativeFunction {
@@ -241,6 +245,7 @@ impl NativeFunction {
         implementation: &into_task_fn(default_fn) as &dyn TaskFn,
         ty: RegistryType::new::<()>("", ""),
         is_root: false,
+        is_session_stateful: false,
     };
 
     pub const fn new<T: TaskFn>(
@@ -249,12 +254,14 @@ impl NativeFunction {
         arg_meta: ArgMeta,
         implementation: &'static T,
         is_root: bool,
+        is_session_stateful: bool,
     ) -> Self {
         Self {
             ty: RegistryType::new::<T>(name, global_name),
             arg_meta,
             implementation,
             is_root,
+            is_session_stateful,
         }
     }
 

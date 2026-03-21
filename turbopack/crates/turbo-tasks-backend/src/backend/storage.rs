@@ -8,12 +8,14 @@ use std::{
     },
 };
 
+use rustc_hash::{FxHashMap, FxHasher};
 use thread_local::ThreadLocal;
+use tracing::span::Id;
 use turbo_bincode::TurboBincodeBuffer;
 use turbo_tasks::{FxDashMap, TaskId, backend::CachedTaskType, event::Event, parallel};
 
 use crate::{
-    backend::storage_schema::TaskStorage,
+    backend::storage_schema::{KeyEvictability, TaskStorage, UnevictableReason, ValueEvictability},
     backing_storage::SnapshotItem,
     database::key_value_database::KeySpace,
     utils::{
@@ -27,6 +29,16 @@ pub enum TaskDataCategory {
     Meta,
     Data,
     All,
+}
+
+/// Counts of tasks evicted at each level.
+#[derive(Debug, Default)]
+pub struct EvictionCounts {
+    pub key_evictions: usize,
+    pub full: usize,
+    pub data_and_meta: usize,
+    pub data_only: usize,
+    pub meta_only: usize,
 }
 
 impl TaskDataCategory {
@@ -97,6 +109,11 @@ pub struct Storage {
     /// Threads waiting for another thread's in-progress restore subscribe to this event,
     /// then re-check the specific task's `restoring`/`restored` bits after waking.
     pub(crate) restored: Event,
+    /// Maps `CachedTaskType` → `TaskId` for deduplication of persistent task creation.
+    /// Acts as a pure performance cache: once `new_task` is cleared (task type persisted to
+    /// backing storage), entries can be evicted and will be restored via `task_by_type()` on
+    /// next miss. Transient task entries are never evicted.
+    pub task_cache: FxDashMap<Arc<CachedTaskType>, TaskId>,
 }
 
 impl Storage {
@@ -112,8 +129,7 @@ impl Storage {
             Default::default(),
             shard_amount,
         );
-        let num_shards = map.shards().len();
-        let shard_modified_counts = (0..num_shards)
+        let shard_modified_counts = (0..shard_amount)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -130,6 +146,7 @@ impl Storage {
             ),
             map,
             restored: Event::new(|| || "Storage::restored".to_string()),
+            task_cache: FxDashMap::default(),
         }
     }
 
@@ -365,6 +382,173 @@ impl Storage {
     pub fn drop_contents(&self) {
         drop_contents(&self.map);
         drop_contents(&self.snapshots);
+        drop_contents(&self.task_cache);
+    }
+
+    /// Evict tasks from in-memory storage after a successful snapshot.
+    ///
+    /// Iterates all tasks and applies the eviction level returned by
+    /// `TaskStorage::evictability()`:
+    /// - `Full`: remove from map entirely
+    /// - `DataAndMeta`: drop both data and meta fields, keep task in map
+    /// - `DataOnly`: drop data fields only
+    /// - `MetaOnly`: drop meta fields only
+    /// - `No`: skip
+    ///
+    /// Must be called when NOT in snapshot mode (i.e., after `end_snapshot()`).
+    pub fn evict_after_snapshot(&self, parent_span: Option<Id>) -> EvictionCounts {
+        let span = tracing::trace_span!(
+            parent: parent_span,
+            "evict_after_snapshot",
+            total_task_cache_keys = self.task_cache.len(),
+            total_map_keys = self.map.len(),
+            task_cache_evictions = tracing::field::Empty,
+            full = tracing::field::Empty,
+            data_and_meta = tracing::field::Empty,
+            data_only = tracing::field::Empty,
+            meta_only = tracing::field::Empty,
+            skipped = tracing::field::Empty,
+            skipped_in_progress = tracing::field::Empty,
+            skipped_restoring = tracing::field::Empty,
+            skipped_modified = tracing::field::Empty,
+            skipped_transient_or_stateful = tracing::field::Empty,
+            skipped_nothing_to_evict = tracing::field::Empty,
+        )
+        .entered();
+        debug_assert!(
+            !self.snapshot_mode(),
+            "evict_after_snapshot must not be called during snapshot mode"
+        );
+
+        let counts: Vec<(EvictionCounts, FxHashMap<UnevictableReason, usize>)> =
+            parallel::map_collect(self.map.shards(), |shard| {
+                let mut shard = shard.write();
+                let mut evicted = EvictionCounts::default();
+                let mut reason_counts: FxHashMap<UnevictableReason, usize> = FxHashMap::default();
+                // SAFETY: We hold the write lock for the duration of iteration.
+                for bucket in unsafe { shard.iter() } {
+                    // SAFETY: The write lock guard outlives the bucket reference.
+                    let (task_id, task) = unsafe { bucket.as_mut() };
+                    if task_id.is_transient() {
+                        continue;
+                    }
+                    let (key, data) = task.get().evictability();
+                    if matches!(key, KeyEvictability::Evictable) {
+                        // The task type is persisted to backing storage (new_task = false),
+                        // so task_cache is a pure perf cache. Remove it now; it will be
+                        // re-populated by task_by_type() on the next cache miss.
+
+                        if self
+                            .task_cache
+                            .remove(task.get().get_persistent_task_type().unwrap().as_ref())
+                            .is_some()
+                        {
+                            evicted.key_evictions += 1;
+                        }
+                    }
+                    // KeyEvictability::AlreadyEvicted: strong_count == 1 means no
+                    // task_cache entry holds a reference — skip the hash lookup.
+                    match data {
+                        ValueEvictability::Full => {
+                            unsafe {
+                                shard.erase(bucket);
+                            }
+                            evicted.full += 1;
+                        }
+                        ValueEvictability::DataAndMeta => {
+                            task.get_mut().drop_data_and_meta();
+                            evicted.data_and_meta += 1;
+                        }
+                        ValueEvictability::DataOnly => {
+                            task.get_mut().drop_data();
+                            evicted.data_only += 1;
+                        }
+                        ValueEvictability::MetaOnly => {
+                            task.get_mut().drop_meta();
+                            evicted.meta_only += 1;
+                        }
+                        ValueEvictability::No(reason) => {
+                            *reason_counts.entry(reason).or_default() += 1;
+                        }
+                    }
+                }
+                // Shrink the shard if it's less than half full, to reclaim slack capacity
+                // after bulk evictions. We already hold the write lock, so this is free
+                // from a locking perspective. TaskId hashing is cheap (it's just an integer).
+                let len = shard.len();
+                if shard.capacity() > len * 2 {
+                    shard.shrink_to(len, |(k, _v)| {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = FxHasher::default();
+                        k.hash(&mut h);
+                        h.finish()
+                    });
+                }
+                (evicted, reason_counts)
+            });
+
+        let mut totals = EvictionCounts::default();
+        let mut reasons: FxHashMap<UnevictableReason, usize> = FxHashMap::default();
+        for (evicted, r) in counts {
+            totals.key_evictions += evicted.key_evictions;
+            totals.full += evicted.full;
+            totals.data_and_meta += evicted.data_and_meta;
+            totals.data_only += evicted.data_only;
+            totals.meta_only += evicted.meta_only;
+            for (reason, count) in r {
+                *reasons.entry(reason).or_default() += count;
+            }
+        }
+        // Shrink task_cache only when we evicted more entries than remain — i.e. the map
+        // is less than half full. shrink_to_fit() acquires each shard write lock in turn
+        // and rehashes surviving CachedTaskType entries, so we gate it on meaningful slack.
+        if totals.key_evictions > self.task_cache.len() {
+            self.task_cache.shrink_to_fit();
+        }
+        let skipped: usize = reasons.values().sum();
+        span.record("task_cache_evictions", totals.key_evictions);
+        span.record("full", totals.full);
+        span.record("data_and_meta", totals.data_and_meta);
+        span.record("data_only", totals.data_only);
+        span.record("meta_only", totals.meta_only);
+        span.record("skipped", skipped);
+        span.record(
+            "skipped_in_progress",
+            reasons
+                .get(&UnevictableReason::InProgress)
+                .copied()
+                .unwrap_or(0),
+        );
+        span.record(
+            "skipped_restoring",
+            reasons
+                .get(&UnevictableReason::Restoring)
+                .copied()
+                .unwrap_or(0),
+        );
+        span.record(
+            "skipped_modified",
+            reasons
+                .get(&UnevictableReason::Modified)
+                .copied()
+                .unwrap_or(0),
+        );
+        span.record(
+            "skipped_transient_or_stateful",
+            reasons
+                .get(&UnevictableReason::TransientOrStateful)
+                .copied()
+                .unwrap_or(0),
+        );
+        span.record(
+            "skipped_nothing_to_evict",
+            reasons
+                .get(&UnevictableReason::NothingToEvict)
+                .copied()
+                .unwrap_or(0),
+        );
+
+        totals
     }
 }
 

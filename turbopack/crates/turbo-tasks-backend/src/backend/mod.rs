@@ -49,7 +49,7 @@ use turbo_tasks::{
 
 pub use self::{
     operation::AnyOperation,
-    storage::{SpecificTaskDataCategory, TaskDataCategory},
+    storage::{EvictionCounts, SpecificTaskDataCategory, TaskDataCategory},
 };
 #[cfg(feature = "trace_task_dirty")]
 use crate::backend::operation::TaskDirtyCause;
@@ -72,8 +72,11 @@ use crate::{
     },
     error::TaskError,
     utils::{
+        arc_or_owned::ArcOrOwned,
         dash_map_drop_contents::drop_contents,
-        dash_map_raw_entry::{RawEntry, get_shard, raw_entry_in_shard, raw_get_in_shard},
+        dash_map_raw_entry::{
+            RawEntry, get_shard, raw_entry, raw_entry_in_shard, raw_get_in_shard,
+        },
         ptr_eq_arc::PtrEqArc,
         shard_amount::compute_shard_amount,
     },
@@ -87,7 +90,7 @@ const DEPENDENT_TASKS_DIRTY_PARALLIZATION_THRESHOLD: usize = 10000;
 const SNAPSHOT_REQUESTED_BIT: usize = 1 << (usize::BITS - 1);
 
 /// Configurable idle timeout for snapshot persistence.
-/// Defaults to 2 seconds if not set or if the value is invalid.
+/// Defaults to 10 seconds if not set or if the value is invalid.
 static IDLE_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     std::env::var("TURBO_ENGINE_SNAPSHOT_IDLE_TIMEOUT_MILLIS")
         .ok()
@@ -144,6 +147,11 @@ pub struct BackendOptions {
 
     /// Avoid big preallocations for faster startup. Should only be used for testing purposes.
     pub small_preallocation: bool,
+
+    /// When enabled, evict all evictable tasks from in-memory storage after every snapshot.
+    /// This reclaims memory by clearing persisted data that can be re-loaded from disk on demand.
+    /// This is an EXPERIMENTAL FEATURE under development
+    pub evict_after_snapshot: bool,
 }
 
 impl Default for BackendOptions {
@@ -154,6 +162,7 @@ impl Default for BackendOptions {
             storage_mode: Some(StorageMode::ReadWrite),
             num_workers: None,
             small_preallocation: false,
+            evict_after_snapshot: false,
         }
     }
 }
@@ -172,8 +181,6 @@ struct TurboTasksBackendInner<B: BackingStorage> {
 
     persisted_task_id_factory: IdFactoryWithReuse<TaskId>,
     transient_task_id_factory: IdFactoryWithReuse<TaskId>,
-
-    task_cache: FxDashMap<Arc<CachedTaskType>, TaskId>,
 
     storage: Storage,
 
@@ -221,6 +228,19 @@ impl<B: BackingStorage> TurboTasksBackend<B> {
     pub fn backing_storage(&self) -> &B {
         &self.0.backing_storage
     }
+
+    /// Perform a snapshot and then evict all evictable tasks from memory.
+    ///
+    /// This is exposed for integration tests that need to verify the
+    /// snapshot → evict → restore cycle works correctly.
+    ///
+    /// Returns `(snapshot_had_new_data, eviction_counts)`.
+    pub fn snapshot_and_evict(
+        &self,
+        turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,
+    ) -> (bool, EvictionCounts) {
+        self.0.snapshot_and_evict(turbo_tasks)
+    }
 }
 
 impl<B: BackingStorage> TurboTasksBackendInner<B> {
@@ -244,7 +264,6 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 TaskId::try_from(TRANSIENT_TASK_BIT).unwrap(),
                 TaskId::MAX,
             ),
-            task_cache: FxDashMap::default(),
             storage: Storage::new(shard_amount, small_preallocation),
             in_progress_operations: AtomicUsize::new(0),
             snapshot_request: Mutex::new(SnapshotRequest::new()),
@@ -338,6 +357,39 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             self.options.storage_mode,
             Some(StorageMode::ReadWrite) | Some(StorageMode::ReadWriteOnShutdown)
         )
+    }
+
+    fn should_evict(&self) -> bool {
+        self.options.evict_after_snapshot && self.should_persist()
+    }
+
+    /// Perform a snapshot and then evict all evictable tasks from memory.
+    ///
+    /// This is exposed for integration tests that need to verify the
+    /// snapshot → evict → restore cycle works correctly.
+    ///
+    /// Returns `(snapshot_had_new_data, eviction_counts)`.
+    #[doc(hidden)]
+    pub fn snapshot_and_evict(
+        &self,
+        turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,
+    ) -> (bool, EvictionCounts) {
+        assert!(
+            self.should_persist(),
+            "snapshot_and_evict requires persistence"
+        );
+        let snapshot_result = self.snapshot_and_persist(None, "test", turbo_tasks);
+        let had_new_data = match snapshot_result {
+            Some((_, new_data)) => new_data,
+            None => {
+                // Snapshot/persist failed — skip eviction since the data may not
+                // be on disk yet. Evicting now could lose in-memory state that
+                // can't be restored.
+                return (false, EvictionCounts::default());
+            }
+        };
+        let counts = self.storage.evict_after_snapshot(None);
+        (had_new_data, counts)
     }
 
     fn should_restore(&self) -> bool {
@@ -1465,7 +1517,6 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         {
             eprintln!("Persisting failed during shutdown: {err:?}");
         }
-        drop_contents(&self.task_cache);
         self.storage.drop_contents();
         if let Err(err) = self.backing_storage.shutdown() {
             println!("Shutting down failed: {err}");
@@ -2770,6 +2821,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                     let mut last_snapshot = self.start_time + Duration::from_millis(last_snapshot);
                     let mut idle_start_listener = self.idle_start_event.listen();
                     let mut idle_end_listener = self.idle_end_event.listen();
+                    // Whether to immediately set an idle timeout if possible
+                    // set to false if we don't persist anything in a cycle.
                     let mut fresh_idle = true;
                     loop {
                         const FIRST_SNAPSHOT_WAIT: Duration = Duration::from_secs(300);
@@ -2803,7 +2856,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                         idle_start_listener = self.idle_start_event.listen()
                                     },
                                     _ = &mut idle_end_listener => {
-                                        idle_time = until + idle_timeout;
+                                        idle_time = far_future();
                                         idle_end_listener = self.idle_end_event.listen()
                                     },
                                     _ = tokio::time::sleep_until(until) => {
@@ -2836,6 +2889,37 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                             Ok((snapshot_start, new_data)) => {
                                 last_snapshot = snapshot_start;
 
+                                // Polls the idle-end event without blocking. Returns
+                                // `true` and refreshes the listener if idle has ended,
+                                // `false` if we are still idle.
+                                macro_rules! check_idle_ended {
+                                    () => {{
+                                        tokio::select! {
+                                            biased;
+                                            _ = &mut idle_end_listener => {
+                                                idle_end_listener = self.idle_end_event.listen();
+                                                true
+                                            },
+                                            _ = std::future::ready(()) => false,
+                                        }
+                                    }};
+                                }
+                                // Evict persisted tasks from memory to reclaim space.
+                                // Like compaction, this runs after snapshot_and_persist
+                                // as a separate concern.
+                                //
+                                // TODO: improve eviction policy — current approach is a full sweep
+                                // after every snapshot. Better strategies to consider:
+                                //   - Memory pressure signals: only evict when RSS exceeds a
+                                //     threshold rather than unconditionally.
+                                //   - Recency data: track last-access time per task and evict
+                                //     least-recently-used entries first rather than all at once.
+                                //   - Eviction intensity: partial sweeps (evict a fraction of
+                                //     eligible tasks per cycle) to reduce latency spikes.
+                                if this.should_evict() && !check_idle_ended!() {
+                                    this.storage.evict_after_snapshot(background_span.id());
+                                }
+
                                 // Compact while idle (up to limit), regardless of
                                 // whether the snapshot had new data.
                                 // `background_span` is not entered here because
@@ -2844,15 +2928,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                 // suspends at the `select!` await below.
                                 const MAX_IDLE_COMPACTION_PASSES: usize = 10;
                                 for _ in 0..MAX_IDLE_COMPACTION_PASSES {
-                                    let idle_ended = tokio::select! {
-                                        biased;
-                                        _ = &mut idle_end_listener => {
-                                            idle_end_listener = self.idle_end_event.listen();
-                                            true
-                                        },
-                                        _ = std::future::ready(()) => false,
-                                    };
-                                    if idle_ended {
+                                    if check_idle_ended!() {
                                         break;
                                     }
                                     // Enter the span only around the synchronous
