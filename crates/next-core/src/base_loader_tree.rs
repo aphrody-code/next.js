@@ -18,6 +18,7 @@ pub struct BaseLoaderTreeBuilder {
     pub imports: Vec<RcStr>,
     pub module_asset_context: ResolvedVc<ModuleAssetContext>,
     pub server_component_transition: ResolvedVc<Box<dyn Transition>>,
+    pub server_hmr: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl BaseLoaderTreeBuilder {
     pub fn new(
         module_asset_context: ResolvedVc<ModuleAssetContext>,
         server_component_transition: ResolvedVc<Box<dyn Transition>>,
+        server_hmr: bool,
     ) -> Self {
         BaseLoaderTreeBuilder {
             inner_assets: FxIndexMap::default(),
@@ -64,6 +66,7 @@ impl BaseLoaderTreeBuilder {
             imports: Vec::new(),
             module_asset_context,
             server_component_transition,
+            server_hmr,
         }
     }
 
@@ -96,16 +99,26 @@ impl BaseLoaderTreeBuilder {
         let i = self.unique_number();
         let identifier = magic_identifier::mangle(&format!("{name} #{i}"));
 
-        self.imports.push(
-            formatdoc!(
-                r#"
-                const {} = () => require(/*turbopackChunkingType: shared*/"MODULE_{}");
-                "#,
-                identifier,
-                i
-            )
-            .into(),
+        let require_line = formatdoc!(
+            r#"
+            const {} = () => require(/*turbopackChunkingType: shared*/"MODULE_{}");
+            "#,
+            identifier,
+            i
         );
+
+        // When server HMR is enabled, emit an accept() call after each Layout
+        // module's require(). This registers the layout loader-tree module as
+        // an HMR boundary: when the page (child) changes, HMR propagation stops
+        // here and the layout itself is not re-evaluated.
+        let accept_line = if self.server_hmr && module_type == AppDirModuleType::Layout {
+            format!("import.meta.turbopackHot.accept(\"MODULE_{i}\");\n")
+        } else {
+            String::new()
+        };
+
+        self.imports
+            .push(format!("{require_line}{accept_line}").into());
 
         let module = self
             .process_source(Vc::upcast(FileSource::new(path.clone())))
