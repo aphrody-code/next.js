@@ -112,7 +112,7 @@ impl BaseLoaderTreeBuilder {
         // an HMR boundary: when the page (child) changes, HMR propagation stops
         // here and the layout itself is not re-evaluated.
         let accept_line = if self.server_hmr && module_type == AppDirModuleType::Layout {
-            format!("import.meta.turbopackHot.accept(\"MODULE_{i}\");\n")
+            format!("\nimport.meta.turbopackHot?.accept(\"MODULE_{i}\");\n")
         } else {
             String::new()
         };
