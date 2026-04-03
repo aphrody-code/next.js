@@ -560,10 +560,11 @@ function disposePhase(
     delete devModuleCache[moduleId]
   }
 
-  // Remove outdated dependencies from parent module's children list.
-  // When a parent accepts a child's update, the child is re-instantiated
-  // but the parent stays alive. We remove the old child reference so it
-  // gets re-added when the child re-imports.
+  // Dispose and evict accepted dependencies from cache.
+  // When a parent accepts a child's update, the child must be disposed and
+  // removed from the module cache so the next require() call re-instantiates
+  // it from the new factory. The parent stays alive and its accept callback
+  // handles the transition.
   for (const [parentId, deps] of outdatedDependencies) {
     const module = devModuleCache[parentId]
     if (module) {
@@ -572,6 +573,11 @@ function disposePhase(
         if (idx >= 0) {
           module.children.splice(idx, 1)
         }
+        // Dispose and evict the accepted dependency so the new factory is
+        // used when it is next required (either by the accept callback or
+        // by the next incoming request).
+        disposeModule(dep, 'replace')
+        delete devModuleCache[dep]
       }
     }
   }
