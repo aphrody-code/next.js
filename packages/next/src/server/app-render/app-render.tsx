@@ -3298,7 +3298,7 @@ async function renderToStream(
         nonce,
       }))
 
-  const [preinitScripts, bootstrapScript] = getRequiredScripts(
+  const [preinitScripts, bootstrapProps] = getRequiredScripts(
     buildManifest,
     // Why is assetPrefix optional on renderOpts?
     // @TODO make it default empty string on renderOpts and get rid of it from ctx
@@ -3307,7 +3307,8 @@ async function renderToStream(
     subresourceIntegrityManifest,
     getAssetQueryString(ctx, true),
     nonce,
-    page
+    page,
+    renderOpts.experimental.turbopackBrowserEsmChunks
   )
 
   // In development mode, set the request ID as a global variable, before the
@@ -4101,7 +4102,7 @@ async function renderToStream(
           },
           maxHeadersLength: reactMaxHeadersLength,
           bootstrapScriptContent,
-          bootstrapScripts: [bootstrapScript],
+          ...bootstrapProps,
           formState,
         }
 
@@ -4239,7 +4240,7 @@ async function renderToStream(
           },
           maxHeadersLength: reactMaxHeadersLength,
           bootstrapScriptContent,
-          bootstrapScripts: [bootstrapScript],
+          ...bootstrapProps,
           formState,
         }
 
@@ -4329,14 +4330,15 @@ async function renderToStream(
         metadata.statusCode = res.statusCode
       }
 
-      const [errorPreinitScripts, errorBootstrapScript] = getRequiredScripts(
+      const [errorPreinitScripts, errorBootstrapProps] = getRequiredScripts(
         buildManifest,
         assetPrefix,
         crossOrigin,
         subresourceIntegrityManifest,
         getAssetQueryString(ctx, false),
         nonce,
-        '/_not-found/page'
+        '/_not-found/page',
+        renderOpts.experimental.turbopackBrowserEsmChunks
       )
 
       if (process.env.__NEXT_USE_NODE_STREAMS) {
@@ -7115,7 +7117,7 @@ async function prerenderToStream(
         nonce,
       }))
 
-  const [preinitScripts, bootstrapScript] = getRequiredScripts(
+  const [preinitScripts, bootstrapProps] = getRequiredScripts(
     buildManifest,
     // Why is assetPrefix optional on renderOpts?
     // @TODO make it default empty string on renderOpts and get rid of it from ctx
@@ -7124,7 +7126,8 @@ async function prerenderToStream(
     subresourceIntegrityManifest,
     getAssetQueryString(ctx, true),
     nonce,
-    page
+    page,
+    renderOpts.experimental.turbopackBrowserEsmChunks
   )
 
   const { reactServerErrorsByDigest } = workStore
@@ -7475,7 +7478,7 @@ async function prerenderToStream(
                 )
               }
             },
-            bootstrapScripts: [bootstrapScript],
+            ...bootstrapProps,
           }
         )
 
@@ -7755,7 +7758,7 @@ async function prerenderToStream(
                 },
                 onHeaders: finalClientOnHeaders,
                 maxHeadersLength: reactMaxHeadersLength,
-                bootstrapScripts: [bootstrapScript],
+                ...bootstrapProps,
               }
             )
 
@@ -8051,7 +8054,7 @@ async function prerenderToStream(
             onError: htmlRendererErrorHandler,
             onHeaders: pprOnHeaders,
             maxHeadersLength: reactMaxHeadersLength,
-            bootstrapScripts: [bootstrapScript],
+            ...bootstrapProps,
           }
         )
       const getServerInsertedHTML = makeGetServerInsertedHTML({
@@ -8273,7 +8276,7 @@ async function prerenderToStream(
         {
           onError: htmlRendererErrorHandler,
           nonce,
-          bootstrapScripts: [bootstrapScript],
+          ...bootstrapProps,
         }
       )
 
@@ -8376,14 +8379,15 @@ async function prerenderToStream(
       metadata.statusCode = res.statusCode
     }
 
-    const [errorPreinitScripts, errorBootstrapScript] = getRequiredScripts(
+    const [errorPreinitScripts, errorBootstrapProps] = getRequiredScripts(
       buildManifest,
       assetPrefix,
       crossOrigin,
       subresourceIntegrityManifest,
       getAssetQueryString(ctx, false),
       nonce,
-      '/_not-found/page'
+      '/_not-found/page',
+      renderOpts.experimental.turbopackBrowserEsmChunks
     )
 
     const prerenderLegacyStore: PrerenderStore = (prerenderStore = {
@@ -8483,7 +8487,7 @@ async function prerenderToStream(
         />,
         {
           nonce,
-          bootstrapScripts: [errorBootstrapScript],
+          ...errorBootstrapProps,
           formState,
         }
       )
