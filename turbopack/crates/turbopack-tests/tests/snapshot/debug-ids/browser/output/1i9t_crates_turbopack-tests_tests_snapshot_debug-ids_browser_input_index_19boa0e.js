@@ -1,4 +1,4 @@
-;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="e5995ba2-d62a-8a86-d5a8-2a4f726bb17a")}catch(e){}}();
+;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="fde71abc-43e5-d417-d690-beb112102cfc")}catch(e){}}();
 (globalThis["TURBOPACK"] || (globalThis["TURBOPACK"] = [])).push([
     "output/1i9t_crates_turbopack-tests_tests_snapshot_debug-ids_browser_input_index_19boa0e.js",
     {"otherChunks":["output/1do3_crates_turbopack-tests_tests_snapshot_debug-ids_browser_input_index_03ibyvs.js"],"runtimeModuleIds":["[project]/turbopack/crates/turbopack-tests/tests/snapshot/debug-ids/browser/input/index.js [test] (ecmascript)"]}
@@ -948,7 +948,7 @@ function formatDependencyChain(dependencyChain) {
         const hotState = moduleHotState.get(module);
         if (// The module is not in the cache. Since this is a "modified" update,
         // it means that the module was never instantiated before.
-        !module || hotState.selfAccepted && !hotState.selfInvalidated) {
+        !module || !autoAcceptRootModules && hotState.selfAccepted && !hotState.selfInvalidated) {
             continue;
         }
         if (hotState.selfDeclined) {
@@ -2253,5 +2253,5 @@ chunkListsToRegister.forEach(registerChunkList);
 })();
 
 
-//# debugId=e5995ba2-d62a-8a86-d5a8-2a4f726bb17a
+//# debugId=fde71abc-43e5-d417-d690-beb112102cfc
 //# sourceMappingURL=1do3_crates_turbopack-tests_tests_snapshot_debug-ids_browser_input_index_19boa0e.js.map

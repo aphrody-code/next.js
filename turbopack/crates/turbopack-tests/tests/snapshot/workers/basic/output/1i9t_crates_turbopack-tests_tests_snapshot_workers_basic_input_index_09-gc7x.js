@@ -947,7 +947,7 @@ function formatDependencyChain(dependencyChain) {
         const hotState = moduleHotState.get(module);
         if (// The module is not in the cache. Since this is a "modified" update,
         // it means that the module was never instantiated before.
-        !module || hotState.selfAccepted && !hotState.selfInvalidated) {
+        !module || !autoAcceptRootModules && hotState.selfAccepted && !hotState.selfInvalidated) {
             continue;
         }
         if (hotState.selfDeclined) {
