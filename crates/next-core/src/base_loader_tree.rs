@@ -107,11 +107,18 @@ impl BaseLoaderTreeBuilder {
             i
         );
 
-        // When server HMR is enabled, emit an accept() call after each Layout
-        // module's require(). This registers the layout loader-tree module as
-        // an HMR boundary: when the page (child) changes, HMR propagation stops
-        // here and the layout itself is not re-evaluated.
-        let accept_line = if self.server_hmr && module_type == AppDirModuleType::Layout {
+        // When server HMR is enabled, emit an accept() call for each non-layout
+        // content module (page, error, loading, etc.). This registers the loader
+        // tree module as an HMR boundary: when a page or other leaf module
+        // changes, HMR propagation stops here and the surrounding layouts are
+        // not re-evaluated.
+        let accept_line = if self.server_hmr
+            && !matches!(
+                module_type,
+                AppDirModuleType::Layout
+                    | AppDirModuleType::GlobalError
+                    | AppDirModuleType::GlobalNotFound
+            ) {
             format!("\nimport.meta.turbopackHot?.accept(\"MODULE_{i}\");\n")
         } else {
             String::new()
