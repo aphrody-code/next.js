@@ -437,7 +437,6 @@ if (skipped) {
           await browser.close()
         }
       })
-
       it('generates a hidden _fallback.html bootstrap document', async () => {
         const outDir = join(next.testDir, 'out')
         const fallbackHtml = await fs.readFile(
