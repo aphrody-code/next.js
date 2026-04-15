@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::SystemTime,
 };
@@ -168,8 +168,7 @@ impl Default for BackendOptions {
 }
 
 pub enum TurboTasksBackendJob {
-    InitialSnapshot,
-    FollowUpSnapshot,
+    Snapshot,
 }
 
 pub struct TurboTasksBackend<B: BackingStorage>(Arc<TurboTasksBackendInner<B>>);
@@ -200,8 +199,6 @@ struct TurboTasksBackendInner<B: BackingStorage> {
     /// operations can continue.
     snapshot_completed: Condvar,
     /// The timestamp of the last started snapshot since [`Self::start_time`].
-    last_snapshot: AtomicU64,
-
     stopping: AtomicBool,
     stopping_event: Event,
     idle_start_event: Event,
@@ -269,7 +266,6 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             snapshot_request: Mutex::new(SnapshotRequest::new()),
             operations_suspended: Condvar::new(),
             snapshot_completed: Condvar::new(),
-            last_snapshot: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             stopping_event: Event::new(|| || "TurboTasksBackend::stopping_event".to_string()),
             idle_start_event: Event::new(|| || "TurboTasksBackend::idle_start_event".to_string()),
@@ -380,8 +376,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         );
         let snapshot_result = self.snapshot_and_persist(None, "test", turbo_tasks);
         let had_new_data = match snapshot_result {
-            Some((_, new_data)) => new_data,
-            None => {
+            Ok((_, new_data)) => new_data,
+            Err(_) => {
                 // Snapshot/persist failed — skip eviction since the data may not
                 // be on disk yet. Evicting now could lose in-memory state that
                 // can't be restored.
@@ -1496,7 +1492,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             // Schedule the snapshot job
             let _span = trace_span!("persisting background job").entered();
             let _span = tracing::info_span!("thread").entered();
-            turbo_tasks.schedule_backend_background_job(TurboTasksBackendJob::InitialSnapshot);
+            turbo_tasks.schedule_backend_background_job(TurboTasksBackendJob::Snapshot);
         }
     }
 
@@ -2814,26 +2810,26 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             match job {
-                TurboTasksBackendJob::InitialSnapshot | TurboTasksBackendJob::FollowUpSnapshot => {
+                TurboTasksBackendJob::Snapshot => {
                     debug_assert!(self.should_persist());
 
-                    let last_snapshot = self.last_snapshot.load(Ordering::Relaxed);
-                    let mut last_snapshot = self.start_time + Duration::from_millis(last_snapshot);
+                    let mut last_snapshot = self.start_time;
                     let mut idle_start_listener = self.idle_start_event.listen();
                     let mut idle_end_listener = self.idle_end_event.listen();
-                    // Whether to immediately set an idle timeout if possible
-                    // set to false if we don't persist anything in a cycle.
+                    // Whether to immediately set an idle timeout if possible.
+                    // Set to false if we don't persist anything in a cycle.
                     let mut fresh_idle = true;
+                    let mut evicted = false;
+                    let mut is_first = true;
                     loop {
                         const FIRST_SNAPSHOT_WAIT: Duration = Duration::from_secs(300);
                         const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(120);
                         let idle_timeout = *IDLE_TIMEOUT;
-                        let (time, mut reason) =
-                            if matches!(job, TurboTasksBackendJob::InitialSnapshot) {
-                                (FIRST_SNAPSHOT_WAIT, "initial snapshot timeout")
-                            } else {
-                                (SNAPSHOT_INTERVAL, "regular snapshot interval")
-                            };
+                        let (time, mut reason) = if is_first {
+                            (FIRST_SNAPSHOT_WAIT, "initial snapshot timeout")
+                        } else {
+                            (SNAPSHOT_INTERVAL, "regular snapshot interval")
+                        };
 
                         let until = last_snapshot + time;
                         if until > Instant::now() {
@@ -2888,6 +2884,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                             }
                             Ok((snapshot_start, new_data)) => {
                                 last_snapshot = snapshot_start;
+                                is_first = false;
 
                                 // Polls the idle-end event without blocking. Returns
                                 // `true` and refreshes the listener if idle has ended,
@@ -2916,8 +2913,43 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                 //     least-recently-used entries first rather than all at once.
                                 //   - Eviction intensity: partial sweeps (evict a fraction of
                                 //     eligible tasks per cycle) to reduce latency spikes.
-                                if this.should_evict() && !check_idle_ended!() {
+                                // Evict when there is new data to persist (the common
+                                // case) or on the very first snapshot after startup
+                                // (data was already on disk from a prior run, so
+                                // new_data may be false but in-memory state can still
+                                // be evicted).
+                                if this.should_evict()
+                                    && (new_data || !evicted)
+                                    && !check_idle_ended!()
+                                {
+                                    evicted = true;
                                     this.storage.evict_after_snapshot(background_span.id());
+
+                                    // Defer a full mimalloc GC until blocking
+                                    // threads have had time to exit and release
+                                    // their thread-local free lists. The delay
+                                    // matches tokio's thread_keep_alive default.
+                                    // Cancel if idle ends before the timer fires.
+                                    let backend = self.clone();
+                                    tokio::task::spawn(async move {
+                                        /// Tokio's blocking thread pool retires idle threads
+                                        /// after `thread_keep_alive` (default 10s); we wait at
+                                        /// least that long sot hose threads have exited and flushed
+                                        /// their mimalloc thread-local freel lists back to the
+                                        /// global pool before the cross-thread collection runs.
+                                        /// Tokio does not expose a getter for this value on the
+                                        /// runtime handle, so we mirror its default here. If the
+                                        /// runtime is configured with a different keep-alive, this
+                                        /// constant should be updated to match.
+                                        const POST_EVICTION_GC_DELAY: Duration =
+                                            Duration::from_secs(10);
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(POST_EVICTION_GC_DELAY) => {
+                                                turbo_tasks_malloc::TurboMalloc::collect(true);
+                                            }
+                                            _ = backend.idle_end_event.listen() => {}
+                                        }
+                                    });
                                 }
 
                                 // Compact while idle (up to limit), regardless of
@@ -2956,18 +2988,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
 
                                 if !new_data {
                                     fresh_idle = false;
-                                    continue;
                                 }
-                                let last_snapshot = last_snapshot.duration_since(self.start_time);
-                                self.last_snapshot.store(
-                                    last_snapshot.as_millis().try_into().unwrap(),
-                                    Ordering::Relaxed,
-                                );
-
-                                turbo_tasks.schedule_backend_background_job(
-                                    TurboTasksBackendJob::FollowUpSnapshot,
-                                );
-                                return;
+                                continue;
                             }
                         }
                     }
@@ -3833,15 +3855,6 @@ impl fmt::Display for DebugTraceTransientTask {
     }
 }
 
-// from https://github.com/tokio-rs/tokio/blob/29cd6ec1ec6f90a7ee1ad641c03e0e00badbcb0e/tokio/src/time/instant.rs#L57-L63
-fn far_future() -> Instant {
-    // Roughly 30 years from now.
-    // API does not provide a way to obtain max `Instant`
-    // or convert specific date in the future to instant.
-    // 1000 years overflows on macOS, 100 years overflows on FreeBSD.
-    Instant::now() + Duration::from_secs(86400 * 365 * 30)
-}
-
 /// Encodes task data, using the provided buffer as a scratch space.  Returns a new exactly sized
 /// buffer.
 /// This allows reusing the buffer across multiple encode calls to optimize allocations and
@@ -3851,6 +3864,15 @@ fn far_future() -> Instant {
 /// fallible encoding. In practice, encoding to a `SmallVec` is infallible (no I/O), and the only
 /// real failure mode — a `TypedSharedReference` whose value type has no bincode impl — is a
 /// programmer error caught by the panic in the caller. Consider making the bincode encoding trait
+// from https://github.com/tokio-rs/tokio/blob/29cd6ec1ec6f90a7ee1ad641c03e0e00badbcb0e/tokio/src/time/instant.rs#L57-L63
+fn far_future() -> Instant {
+    // Roughly 30 years from now. Used as a "timer disabled" sentinel.
+    // API does not provide a way to obtain max `Instant`
+    // or convert specific date in the future to instant.
+    // 1000 years overflows on macOS, 100 years overflows on FreeBSD.
+    Instant::now() + Duration::from_secs(86400 * 365 * 30)
+}
+
 /// infallible (i.e. returning `()` instead of `Result<(), EncodeError>`) to eliminate the
 /// spurious `Result` threading throughout the encode path.
 fn encode_task_data(
