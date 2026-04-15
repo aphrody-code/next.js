@@ -777,6 +777,7 @@ pub async fn parse_from_file(
     source: ResolvedVc<Box<dyn Source>>,
     ty: EcmascriptModuleAssetType,
     transforms: ResolvedVc<EcmascriptInputTransforms>,
+    node_env: RcStr,
 ) -> Result<Vc<ParseResult>> {
     let fs_path = source.ident().path().owned().await?;
     let ident = &*source.ident().to_string().await?;
@@ -794,6 +795,7 @@ pub async fn parse_from_file(
                 source,
                 ty,
                 transforms,
+                node_env,
                 false,
                 false,
             )
