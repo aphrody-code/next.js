@@ -10493,6 +10493,7 @@ dependencies = [
  "turbopack-swc-utils",
  "turbopack-test-utils",
  "url",
+ "urlencoding",
 ]
 
 [[package]]
