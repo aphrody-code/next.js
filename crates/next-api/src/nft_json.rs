@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -249,35 +249,45 @@ impl Asset for NftJsonAsset {
                 None
             };
 
-            let entries = Vc::cell(entries);
-            // Collect referenced chunks (e.g. dynamic imports, etc).
-            let all_assets =
-                all_assets_from_entries_filtered(entries, Some(client_root.clone()), exclude_glob)
-                    .await?;
+            enum AssetOrModule {
+                Asset(ResolvedVc<Box<dyn OutputAsset>>),
+                Module(ResolvedVc<Box<dyn Module>>),
+            }
 
+            // Collect referenced chunks (e.g. dynamic imports, etc).
+            let all_assets = all_assets_from_entries_filtered(
+                Vc::cell(entries),
+                Some(client_root.clone()),
+                exclude_glob,
+            )
+            .await?;
             // Collect referenced assets and externals from module graph
+            // TODO pass exclude_glob
             let all_modules =
                 traced_modules_for_entries(this.module_graph, &this.entry_modules).await?;
 
-            for referenced_chunk_path in all_assets
+            for referenced in all_assets
                 .iter()
                 .filter(|a| **a != chunk)
-                .map(|a| a.path())
-                .chain(all_modules.iter().map(|m| m.ident().path()))
+                .copied()
+                .map(AssetOrModule::Asset)
+                .chain(all_modules.iter().copied().map(AssetOrModule::Module))
             {
-                let referenced_chunk_path = referenced_chunk_path.await?;
-                // if referenced_chunk_path == next_config_path {
-                //     // If next.config.js was traced, assume that the whole project was traced
-                //     // (unintentionally). Print a message in this case to avoid deploying
-                //     // unnecessary files.
-                //     error_unexpected_file(
-                //         entries,
-                //         Some(client_root.clone()),
-                //         exclude_glob,
-                //         *referenced_chunk,
-                //     )
-                //     .await?;
-                // }
+                let referenced_chunk_path = match referenced {
+                    AssetOrModule::Asset(v) => v.path().await?,
+                    AssetOrModule::Module(v) => v.ident().path().await?,
+                };
+                if let AssetOrModule::Module(referenced) = referenced
+                    && referenced_chunk_path == next_config_path
+                {
+                    // If next.config.js was traced, assume that the whole project was traced
+                    // (unintentionally). Print a message in this case to avoid deploying
+                    // unnecessary files.
+                    ForbiddenTracedFileIssue::new(*referenced)
+                        .to_resolved()
+                        .await?
+                        .emit();
+                }
 
                 if referenced_chunk_path.has_extension(".map") {
                     continue;
@@ -506,86 +516,17 @@ pub async fn all_assets_from_entries_filtered(
     ))
 }
 
-#[turbo_tasks::function]
-pub async fn error_unexpected_file(
-    entries: Vc<OutputAssets>,
-    client_root: Option<FileSystemPath>,
-    exclude_glob: Option<Vc<Glob>>,
-    referenced_chunk: ResolvedVc<Box<dyn OutputAsset>>,
-) -> Result<()> {
-    let exclude_glob = if let Some(exclude_glob) = exclude_glob {
-        Some(exclude_glob.await?)
-    } else {
-        None
-    };
-    let emit_spans = tracing::enabled!(Level::INFO);
-    let map = AdjacencyMap::new()
-        .visit(
-            entries
-                .await?
-                .iter()
-                .map(async |asset| {
-                    Ok((
-                        *asset,
-                        if emit_spans {
-                            // INVALIDATION: we don't need to invalidate the list of assets when
-                            // the span name changes
-                            Some(asset.path_string().untracked().await?)
-                        } else {
-                            None
-                        },
-                    ))
-                })
-                .try_join()
-                .await?,
-            OutputAssetFilteredVisit {
-                client_root,
-                exclude_glob,
-                emit_spans,
-            },
-        )
-        .await
-        .completed()?;
-
-    let reversed = map.reversed();
-
-    let mut path = vec![];
-    // Find any path from the referenced chunk back to one of the roots
-    {
-        let mut visited = HashSet::new();
-        let mut current = (
-            referenced_chunk,
-            if emit_spans {
-                // INVALIDATION: we don't need to invalidate the list of assets when
-                // the span name changes
-                Some(referenced_chunk.path_string().untracked().await?)
-            } else {
-                None
-            },
-        );
-        while let Some((from, _)) = reversed.get(&current).and_then(|mut edges| edges.next()) {
-            current = from.clone();
-            if !visited.insert(current.0) {
-                break;
-            }
-            path.push(current.0);
-        }
-    }
-
-    ForbiddenTracedFileIssue {
-        file: referenced_chunk,
-        path,
-    }
-    .resolved_cell()
-    .emit();
-
-    Ok(())
-}
-
 #[turbo_tasks::value(shared)]
 struct ForbiddenTracedFileIssue {
-    file: ResolvedVc<Box<dyn OutputAsset>>,
-    path: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
+    module: ResolvedVc<Box<dyn Module>>,
+}
+
+#[turbo_tasks::value_impl]
+impl ForbiddenTracedFileIssue {
+    #[turbo_tasks::function]
+    pub fn new(module: ResolvedVc<Box<dyn Module>>) -> Vc<Self> {
+        Self { module }.cell()
+    }
 }
 
 #[async_trait]
@@ -602,7 +543,7 @@ impl Issue for ForbiddenTracedFileIssue {
     }
 
     async fn file_path(&self) -> Result<FileSystemPath> {
-        self.file.path().owned().await
+        self.module.ident().path().owned().await
     }
 
     async fn title(&self) -> Result<StyledString> {
@@ -612,7 +553,7 @@ impl Issue for ForbiddenTracedFileIssue {
     }
 
     async fn description(&self) -> Result<Option<StyledString>> {
-        let mut stack = vec![
+        let stack = vec![
             StyledString::Text(rcstr!(
                 "A file was traced that indicates that the whole project was traced \
                  unintentionally. Somewhere in the import trace below, there are:"
@@ -648,26 +589,6 @@ impl Issue for ForbiddenTracedFileIssue {
                 )),
             ]),
         ];
-
-        if self.path.len() > 1 {
-            stack.extend([
-                StyledString::Text(rcstr!("")),
-                StyledString::Text(
-                    format!(
-                        "Output asset trace:\n{}",
-                        self.path
-                            .iter()
-                            .rev()
-                            .map(async |a| Ok(format!("  {}", a.path_string().await?)))
-                            .try_join()
-                            .await?
-                            .join("\n")
-                    )
-                    .into(),
-                ),
-            ])
-        }
-
         Ok(Some(StyledString::Stack(stack)))
     }
 }
