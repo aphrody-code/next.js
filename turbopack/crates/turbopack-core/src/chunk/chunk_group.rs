@@ -265,12 +265,6 @@ pub async fn chunk_group_content(
                 },
             )) = parent_info
             {
-                if should_trace {
-                    let ModuleOrBatch::Module(module) = node else {
-                        unreachable!();
-                    };
-                    state.traced_modules.insert(module);
-                }
                 return Ok(GraphTraversalAction::Exclude);
             }
 

@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use rustc_hash::FxHashSet;
 use serde_json::json;
 use tracing::{Instrument, Level, Span};
 use turbo_rcstr::{RcStr, rcstr};
@@ -16,7 +17,10 @@ use turbo_tasks_fs::{
 };
 use turbopack_core::{
     asset::{Asset, AssetContent},
+    chunk::ChunkingType,
     issue::{Issue, IssueExt, IssueSeverity, IssueStage, StyledString},
+    module::Module,
+    module_graph::{GraphTraversalAction, ModuleGraph},
     output::{OutputAsset, OutputAssets, OutputAssetsReference},
 };
 
@@ -41,6 +45,9 @@ pub struct NftJsonAsset {
     additional_assets: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
     // The page name, e.g. `pages/index` or `app/route1`
     page_name: Option<String>,
+
+    module_graph: ResolvedVc<ModuleGraph>,
+    entry_modules: Vec<ResolvedVc<Box<dyn Module>>>,
 }
 
 #[turbo_tasks::value_impl]
@@ -51,12 +58,16 @@ impl NftJsonAsset {
         page_name: Option<RcStr>,
         chunk: ResolvedVc<Box<dyn OutputAsset>>,
         additional_assets: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
+        module_graph: ResolvedVc<ModuleGraph>,
+        entry_modules: Vec<ResolvedVc<Box<dyn Module>>>,
     ) -> Vc<Self> {
         NftJsonAsset {
             chunk,
             project,
             additional_assets,
             page_name: page_name.map(|page_name| format!("/{page_name}")),
+            module_graph,
+            entry_modules,
         }
         .cell()
     }
@@ -239,30 +250,34 @@ impl Asset for NftJsonAsset {
             };
 
             let entries = Vc::cell(entries);
-            // Collect base assets first
+            // Collect referenced chunks (e.g. dynamic imports, etc).
             let all_assets =
                 all_assets_from_entries_filtered(entries, Some(client_root.clone()), exclude_glob)
                     .await?;
 
-            for referenced_chunk in all_assets.iter().copied() {
-                if chunk.eq(&referenced_chunk) {
-                    continue;
-                }
+            // Collect referenced assets and externals from module graph
+            let all_modules =
+                traced_modules_for_entries(this.module_graph, &this.entry_modules).await?;
 
-                let referenced_chunk_path = referenced_chunk.path().await?;
-
-                if referenced_chunk_path == next_config_path {
-                    // If next.config.js was traced, assume that the whole project was traced
-                    // (unintentionally). Print a message in this case to avoid deploying
-                    // unnecessary files.
-                    error_unexpected_file(
-                        entries,
-                        Some(client_root.clone()),
-                        exclude_glob,
-                        *referenced_chunk,
-                    )
-                    .await?;
-                }
+            for referenced_chunk_path in all_assets
+                .iter()
+                .filter(|a| **a != chunk)
+                .map(|a| a.path())
+                .chain(all_modules.iter().map(|m| m.ident().path()))
+            {
+                let referenced_chunk_path = referenced_chunk_path.await?;
+                // if referenced_chunk_path == next_config_path {
+                //     // If next.config.js was traced, assume that the whole project was traced
+                //     // (unintentionally). Print a message in this case to avoid deploying
+                //     // unnecessary files.
+                //     error_unexpected_file(
+                //         entries,
+                //         Some(client_root.clone()),
+                //         exclude_glob,
+                //         *referenced_chunk,
+                //     )
+                //     .await?;
+                // }
 
                 if referenced_chunk_path.has_extension(".map") {
                     continue;
@@ -311,9 +326,9 @@ impl Asset for NftJsonAsset {
                         // ast-grep-ignore: no-context-turbofmt
                         return Err(err.context(
                             turbofmt!(
-                                "NftJsonAsset: cannot handle filepath '{referenced_chunk_path}' \
-                                 for {referenced_chunk:?} it is not under the output_root: \
-                                 '{output_root_ref}' or the project_root: '{project_root_ref}'",
+                                "NftJsonAsset: cannot handle filepath '{referenced_chunk_path}', \
+                                 it is not under the output_root: '{output_root_ref}' or the \
+                                 project_root: '{project_root_ref}'",
                             )
                             .await?,
                         ));
@@ -383,6 +398,34 @@ impl Asset for NftJsonAsset {
         .instrument(span)
         .await
     }
+}
+
+async fn traced_modules_for_entries(
+    module_graph: ResolvedVc<ModuleGraph>,
+    entry_modules: &[ResolvedVc<Box<dyn Module>>],
+) -> Result<Vec<ResolvedVc<Box<dyn Module>>>> {
+    let mut result = vec![];
+
+    let mut is_traced = FxHashSet::default();
+
+    module_graph.await?.traverse_edges_dfs(
+        entry_modules.iter().copied(),
+        &mut (),
+        |parent, target, _| {
+            let Some((parent, ref_data)) = parent else {
+                return Ok(GraphTraversalAction::Continue);
+            };
+
+            if ref_data.chunking_type == ChunkingType::Traced || is_traced.contains(&parent) {
+                is_traced.insert(target);
+                result.push(target);
+            }
+            Ok(GraphTraversalAction::Continue)
+        },
+        |_, _, _| Ok(()),
+    )?;
+
+    Ok(result)
 }
 
 /// The globs defined in the next.config.mjs are relative to the project root.

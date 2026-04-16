@@ -34,9 +34,7 @@ pub trait ModuleReference: ValueToString {
     // TODO think about different types
     // fn kind(&self) -> Vc<AssetReferenceType>;
 
-    fn chunking_type(&self) -> Option<ChunkingType> {
-        None
-    }
+    fn chunking_type(&self) -> Option<ChunkingType>;
 
     fn binding_usage(&self) -> BindingUsage {
         BindingUsage::default()
@@ -70,6 +68,11 @@ impl ModuleReference for SingleModuleReference {
     #[turbo_tasks::function]
     fn resolve_reference(&self) -> Vc<ModuleResolveResult> {
         *ModuleResolveResult::module(self.module)
+    }
+
+    fn chunking_type(&self) -> Option<ChunkingType> {
+        // TODO what is this even used for??
+        None
     }
 }
 
@@ -146,6 +149,11 @@ impl ModuleReference for SingleOutputAssetReference {
     #[turbo_tasks::function]
     fn resolve_reference(&self) -> Vc<ModuleResolveResult> {
         *ModuleResolveResult::output_asset(RequestKey::default(), self.asset)
+    }
+
+    fn chunking_type(&self) -> Option<ChunkingType> {
+        // TODO what is this even used for??
+        None
     }
 }
 
