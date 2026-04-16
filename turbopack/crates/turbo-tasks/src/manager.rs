@@ -1208,29 +1208,26 @@ impl<B: Backend> Executor<TurboTasks<B>, ScheduledTask, TaskPriority> for TurboT
                 let this2 = this.clone();
                 let this = this.clone();
                 let future = async move {
-                    let mut schedule_again = true;
-                    while schedule_again {
+                    let mut current_priority = priority;
+                    loop {
                         // it's okay for execution ids to overflow and wrap, they're just used for
                         // an assert
                         let execution_id = this.execution_id_factory.wrapping_get();
                         let current_task_state = Arc::new(RwLock::new(CurrentTaskState::new(
                             task_id,
                             execution_id,
-                            priority,
+                            current_priority,
                             false, // in_top_level_task
                         )));
                         let single_execution_future = async {
                             if this.stopped.load(Ordering::Acquire) {
                                 this.backend.task_execution_canceled(task_id, &*this);
-                                return false;
+                                return None;
                             }
 
-                            let Some(TaskExecutionSpec { future, span }) = this
+                            let TaskExecutionSpec { future, span } = this
                                 .backend
-                                .try_start_task_execution(task_id, priority, &*this)
-                            else {
-                                return false;
-                            };
+                                .try_start_task_execution(task_id, current_priority, &*this)?;
 
                             async {
                                 let result = CaptureFuture::new(future).await;
@@ -1260,9 +1257,26 @@ impl<B: Backend> Executor<TurboTasks<B>, ScheduledTask, TaskPriority> for TurboT
                             .instrument(span)
                             .await
                         };
-                        schedule_again = CURRENT_TASK_STATE
+                        let reschedule = CURRENT_TASK_STATE
                             .scope(current_task_state, single_execution_future)
                             .await;
+                        match reschedule {
+                            None => break,
+                            Some(stale_priority) => {
+                                if stale_priority >= current_priority {
+                                    // Fast path: the stale priority is at least as high as the
+                                    // current priority, so we can directly re-execute without
+                                    // going through the priority queue.
+                                    current_priority = stale_priority;
+                                } else {
+                                    // The stale priority is lower than the current priority.
+                                    // Re-schedule via the priority runner so higher-priority
+                                    // tasks can run first.
+                                    this.schedule(task_id, stale_priority);
+                                    break;
+                                }
+                            }
+                        }
                     }
                     this.finish_foreground_job();
                 };
