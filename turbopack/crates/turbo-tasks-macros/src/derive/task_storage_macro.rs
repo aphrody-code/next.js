@@ -644,8 +644,35 @@ impl GroupedFields {
     }
 
     /// Returns an iterator over all lazy fields (both data and meta categories).
+    ///
+    /// The order is **sorted by category** — transient variants first, then
+    /// meta, then data — with schema declaration order preserved within each
+    /// category. This grouping is load-bearing for codegen: contiguous
+    /// categories in the generated `LazyField` enum let LLVM lower
+    /// `is_persistent()` / `is_meta()` to a single integer range check on the
+    /// discriminant tag instead of a per-variant jump table.
+    ///
+    /// Every downstream generator (enum declaration, `index_and_persistence`,
+    /// restore merge arms, `build_lazy_index`) iterates `all_lazy()` and uses
+    /// `enumerate()` positions as the variant index, so they all pick up the
+    /// same sorted order consistently. `persistent_lazy(category)` does not
+    /// need to match this order because its consumers (bincode encode/decode,
+    /// clone arms) use per-category enumeration and Rust match arms are
+    /// order-independent.
     fn all_lazy(&self) -> impl Iterator<Item = &FieldInfo> {
-        self.fields.iter().filter(|f| !f.is_flag() && f.lazy)
+        let mut lazy: Vec<&FieldInfo> = self
+            .fields
+            .iter()
+            .filter(|f| !f.is_flag() && f.lazy)
+            .collect();
+        // Stable sort by category rank; within a category, preserve schema
+        // declaration order.
+        lazy.sort_by_key(|f| match f.category {
+            Category::Transient => 0u8,
+            Category::Meta => 1,
+            Category::Data => 2,
+        });
+        lazy.into_iter()
     }
 
     /// Returns true if there are any lazy fields.
@@ -1009,41 +1036,66 @@ fn generate_lazy_field_enum(grouped_fields: &GroupedFields) -> TokenStream {
         })
         .collect();
 
-    // Generate is_persistent (transient check) method arms
-    let is_persistent_arms: Vec<_> = all_lazy_fields
+    // Or-pattern lists for `is_persistent` / `is_meta`. Because `all_lazy()`
+    // returns variants grouped by category (transient, then meta, then data),
+    // these lists cover contiguous runs of the enum, giving LLVM the clearest
+    // shape to lower each predicate to a single integer range check on the
+    // discriminant tag.
+    let persistent_patterns: Vec<_> = all_lazy_fields
         .iter()
-        .map(|field| {
-            let variant_name = &field.variant_name;
-            let is_persistent = !field.is_transient();
-            quote! {
-                LazyField::#variant_name(_) => #is_persistent
-            }
+        .filter(|f| !f.is_transient())
+        .map(|f| {
+            let variant_name = &f.variant_name;
+            quote! { LazyField::#variant_name(_) }
+        })
+        .collect();
+    let meta_patterns: Vec<_> = all_lazy_fields
+        .iter()
+        .filter(|f| f.category == Category::Meta)
+        .map(|f| {
+            let variant_name = &f.variant_name;
+            quote! { LazyField::#variant_name(_) }
+        })
+        .collect();
+    let data_patterns: Vec<_> = all_lazy_fields
+        .iter()
+        .filter(|f| f.category == Category::Data)
+        .map(|f| {
+            let variant_name = &f.variant_name;
+            quote! { LazyField::#variant_name(_) }
         })
         .collect();
 
-    // Generate is_meta/is_data method arms
-    let is_meta_arms: Vec<_> = all_lazy_fields
-        .iter()
-        .map(|field| {
-            let variant_name = &field.variant_name;
-            let is_meta = field.category == Category::Meta;
-            quote! {
-                LazyField::#variant_name(_) => #is_meta
-            }
-        })
-        .collect();
+    // `matches!(self, ... | ... )` requires at least one pattern. Fall back to
+    // `false` if the schema has no variants in a given category.
+    let is_persistent_body = if persistent_patterns.is_empty() {
+        quote! { false }
+    } else {
+        quote! { matches!(self, #(#persistent_patterns)|*) }
+    };
+    let is_meta_body = if meta_patterns.is_empty() {
+        quote! { false }
+    } else {
+        quote! { matches!(self, #(#meta_patterns)|*) }
+    };
+    let is_data_body = if data_patterns.is_empty() {
+        quote! { false }
+    } else {
+        quote! { matches!(self, #(#data_patterns)|*) }
+    };
 
-    // Generate discriminant_index method arms: each variant maps to its
-    // position in the enum definition. Used to index into a fixed-size array
-    // for O(1) variant lookup (e.g. when merging transient residue on restore).
-    let discriminant_arms: Vec<_> = all_lazy_fields
+    // (discriminant, is_persistent) arms for the restore prescan — each
+    // variant maps to its position in the enum definition (used as a
+    // fixed-size array offset) paired with its persistence bit.
+    let index_and_persistence_arms: Vec<_> = all_lazy_fields
         .iter()
         .enumerate()
         .map(|(idx, field)| {
             let variant_name = &field.variant_name;
             let idx = idx as u8;
+            let is_persistent = !field.is_transient();
             quote! {
-                LazyField::#variant_name(_) => #idx
+                LazyField::#variant_name(_) => (#idx, #is_persistent)
             }
         })
         .collect();
@@ -1072,32 +1124,43 @@ fn generate_lazy_field_enum(grouped_fields: &GroupedFields) -> TokenStream {
                 }
             }
 
-            #[doc = "Returns true if this field should be persisted (not transient)"]
-            pub fn is_persistent(&self) -> bool {
-                match self {
-                    #(#is_persistent_arms),*
-                }
-            }
-
-            #[doc = "Returns true if this field belongs to the meta category"]
-            pub fn is_meta(&self) -> bool {
-                match self {
-                    #(#is_meta_arms),*
-                }
-            }
-
-            #[doc = "Returns true if this field belongs to the data category"]
-            pub fn is_data(&self) -> bool {
-                !self.is_meta()
-            }
-
-            #[doc = "Variant index (position in the LazyField enum definition)."]
+            #[doc = "Returns true if this field should be persisted (not transient)."]
             #[doc = ""]
-            #[doc = "Stable per-variant index usable as an array offset; see"]
-            #[doc = "`NUM_VARIANTS` for the array size."]
-            pub const fn discriminant_index(&self) -> u8 {
+            #[doc = "Variants are sorted so persistent variants form a contiguous"]
+            #[doc = "range; LLVM can lower this `matches!` to a single integer"]
+            #[doc = "compare on the discriminant tag."]
+            #[inline]
+            pub fn is_persistent(&self) -> bool {
+                #is_persistent_body
+            }
+
+            #[doc = "Returns true if this field belongs to the meta category."]
+            #[doc = ""]
+            #[doc = "Meta variants form a contiguous range between the transient"]
+            #[doc = "prefix and the data suffix; expect a range-check lowering."]
+            #[inline]
+            pub fn is_meta(&self) -> bool {
+                #is_meta_body
+            }
+
+            #[doc = "Returns true if this field belongs to the data category."]
+            #[doc = ""]
+            #[doc = "Data variants form the trailing contiguous range of the"]
+            #[doc = "enum; expect a range-check lowering."]
+            #[inline]
+            pub fn is_data(&self) -> bool {
+                #is_data_body
+            }
+
+            #[doc = "Variant index paired with whether this variant is persistent."]
+            #[doc = ""]
+            #[doc = "Index is the variant's position in the LazyField enum"]
+            #[doc = "definition, usable as an array offset of size `NUM_VARIANTS`."]
+            #[doc = "Used by the restore prescan to answer both \"where does this"]
+            #[doc = "variant live?\" and \"do we care about it?\" in a single match."]
+            const fn index_and_persistence(&self) -> (u8, bool) {
                 match self {
-                    #(#discriminant_arms),*
+                    #(#index_and_persistence_arms),*
                 }
             }
         }
@@ -3571,13 +3634,17 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
 
                 #restore_meta_flags
 
-                // Merge persistent meta lazy fields. Build a discriminant → index
-                // map over `self.lazy` once, then merge each source variant in
-                // O(1) by discriminant.
-                let index = Self::build_lazy_index(&self.lazy);
-                for field in source.lazy {
-                    debug_assert!(field.is_persistent());
-                    self.restore_lazy_field(field, &index);
+                // Cold path when `self.lazy` has no persistent residue: bulk
+                // extend. Otherwise build a discriminant → position index and
+                // merge each source variant in O(1).
+                match Self::build_lazy_index(&self.lazy) {
+                    None => self.lazy.extend(source.lazy),
+                    Some(index) => {
+                        for field in source.lazy {
+                            debug_assert!(field.is_persistent());
+                            self.restore_lazy_field(field, &index);
+                        }
+                    }
                 }
             }
 
@@ -3591,10 +3658,14 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
 
                 #restore_data_flags
 
-                let index = Self::build_lazy_index(&self.lazy);
-                for field in source.lazy {
-                    debug_assert!(field.is_persistent());
-                    self.restore_lazy_field(field, &index);
+                match Self::build_lazy_index(&self.lazy) {
+                    None => self.lazy.extend(source.lazy),
+                    Some(index) => {
+                        for field in source.lazy {
+                            debug_assert!(field.is_persistent());
+                            self.restore_lazy_field(field, &index);
+                        }
+                    }
                 }
             }
 
@@ -3611,25 +3682,43 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
 
                 #restore_all_flags
 
-                let index = Self::build_lazy_index(&self.lazy);
-                for field in source.lazy {
-                    debug_assert!(field.is_persistent());
-                    self.restore_lazy_field(field, &index);
+                match Self::build_lazy_index(&self.lazy) {
+                    None => self.lazy.extend(source.lazy),
+                    Some(index) => {
+                        for field in source.lazy {
+                            debug_assert!(field.is_persistent());
+                            self.restore_lazy_field(field, &index);
+                        }
+                    }
                 }
             }
 
             /// Build a discriminant → position lookup table over `lazy`.
             ///
-            /// `u8::MAX` marks "variant not present". Relies on `lazy.len() < 255`
-            /// which is trivially true (at most `LazyField::NUM_VARIANTS` entries,
-            /// which is well under 255).
-            fn build_lazy_index(lazy: &[LazyField]) -> [u8; LazyField::NUM_VARIANTS] {
+            /// Returns `None` if `lazy` contains no persistent entries — the hot
+            /// path for cold restores, where the caller can skip per-field
+            /// dispatch and bulk-extend directly. `Some(index)` is returned
+            /// only when persistent residue is present; `u8::MAX` marks
+            /// "variant not present".
+            ///
+            /// Relies on `lazy.len() < 255`, which is trivially true (at most
+            /// `LazyField::NUM_VARIANTS` entries, well under 255).
+            fn build_lazy_index(
+                lazy: &[LazyField],
+            ) -> Option<[u8; LazyField::NUM_VARIANTS]> {
                 debug_assert!(lazy.len() < u8::MAX as usize);
-                let mut index = [u8::MAX; LazyField::NUM_VARIANTS];
-                for (i, f) in lazy.iter().enumerate() {
-                    index[f.discriminant_index() as usize] = i as u8;
+                // Fast path: fresh task with no residue at all.
+                if lazy.is_empty() {
+                    return None;
                 }
-                index
+                let mut index = [u8::MAX; LazyField::NUM_VARIANTS];
+                let mut any_persistent = false;
+                for (i, f) in lazy.iter().enumerate() {
+                    let (d, is_persistent) = f.index_and_persistence();
+                    index[d as usize] = i as u8;
+                    any_persistent |= is_persistent;
+                }
+                any_persistent.then_some(index)
             }
 
             /// Merge a single persistent `LazyField` from a decoded snapshot into
@@ -3656,9 +3745,8 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
 
 /// Generate a match arm for `restore_lazy_field` that merges an incoming
 /// persistent `filter_transient` variant into `self.lazy` using the precomputed
-/// discriminant → position `index`. `discriminant` must equal
-/// `all_lazy().position(...)` for this variant — i.e. its
-/// `discriminant_index()` value.
+/// discriminant → position `index`. `discriminant` must equal the variant's
+/// position in `all_lazy()` (and in the `LazyField` enum definition).
 ///
 /// On residue hit: merge the incoming collection into the existing one.
 /// On miss: push the variant. `source.lazy` never contains duplicate variants,
