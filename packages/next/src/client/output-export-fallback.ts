@@ -69,6 +69,16 @@ export function getOutputExportFallbackCandidates(pathname: string): string[] {
   )
 }
 
+function getOutputExportNotFoundPath(prefix: string): string {
+  return prefix.length > 0 ? `/${prefix}/_not-found` : '/_not-found'
+}
+
+export function getOutputExportNotFoundCandidates(pathname: string): string[] {
+  return getOutputExportCandidatePrefixes(pathname).map((prefix) =>
+    getOutputExportNotFoundPath(prefix)
+  )
+}
+
 export function addOutputExportDataSuffix(url: URL): URL {
   const nextUrl = new URL(url)
   if (nextUrl.pathname.endsWith('/')) {
@@ -329,6 +339,25 @@ export async function fetchOutputExportDataResponse(
 ): Promise<Response | null> {
   const result = await fetchOutputExportDataResult(renderedUrl, init)
   return result?.response ?? null
+}
+
+export async function fetchOutputExportNotFoundDataResponse(
+  renderedUrl: URL,
+  init?: RequestInit
+): Promise<Response | null> {
+  for (const candidate of getOutputExportNotFoundCandidates(
+    renderedUrl.pathname
+  )) {
+    const candidateUrl = new URL(renderedUrl)
+    candidateUrl.pathname = candidate
+
+    const response = await fetchOutputExportDataResponse(candidateUrl, init)
+    if (response !== null) {
+      return response
+    }
+  }
+
+  return null
 }
 
 export async function fetchOutputExportFallbackResponse(

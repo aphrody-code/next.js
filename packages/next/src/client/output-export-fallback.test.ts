@@ -3,9 +3,11 @@ import {
   clearOutputExportFallbackManifestCache,
   fetchOutputExportDataResponse,
   fetchOutputExportFallbackResponse,
+  fetchOutputExportNotFoundDataResponse,
   getCachedOutputExportFallbackDataUrl,
   getCachedOutputExportFallbackRequestUrl,
   getOutputExportFallbackCandidates,
+  getOutputExportNotFoundCandidates,
   stripOutputExportDataSuffix,
 } from './output-export-fallback'
 
@@ -44,6 +46,15 @@ describe('output export fallback helpers', () => {
     expect(getOutputExportFallbackCandidates('/optional/')).toEqual([
       '/optional/__fallback',
       '/__fallback',
+    ])
+  })
+
+  it('discovers not-found candidates from deepest static prefix to root', () => {
+    expect(getOutputExportNotFoundCandidates('/docs/missing/route')).toEqual([
+      '/docs/missing/route/_not-found',
+      '/docs/missing/_not-found',
+      '/docs/_not-found',
+      '/_not-found',
     ])
   })
 
@@ -470,6 +481,40 @@ describe('output export fallback helpers', () => {
       'https://example.com/docs/__fallback/__route_0.txt',
       'https://example.com/docs/api/guide/__fallback.txt',
       'https://example.com/docs/api/guide/__fallback.meta.json',
+    ])
+  })
+
+  it('tries subpath-prefixed not-found payloads before falling back to root', async () => {
+    process.env.__NEXT_TRAILING_SLASH = 'false'
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+
+      if (url.endsWith('/docs/_not-found.txt')) {
+        return new Response('not found payload', {
+          status: 200,
+          headers: { 'content-type': 'text/plain' },
+        })
+      }
+
+      return new Response('<!doctype html><title>fallback</title>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      })
+    })
+
+    global.fetch = fetchMock as typeof fetch
+
+    const response = await fetchOutputExportNotFoundDataResponse(
+      new URL('https://example.com/docs/missing/route')
+    )
+
+    expect(response).not.toBeNull()
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://example.com/docs/missing/route/_not-found.txt',
+      'https://example.com/docs/missing/route/_not-found/index.txt',
+      'https://example.com/docs/missing/_not-found.txt',
+      'https://example.com/docs/missing/_not-found/index.txt',
+      'https://example.com/docs/_not-found.txt',
     ])
   })
 })
