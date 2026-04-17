@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    fmt::{Display, Formatter},
     hash::{BuildHasher, Hash},
     ops::{Deref, DerefMut},
     sync::{
@@ -20,7 +21,7 @@ use crate::{
     utils::{
         dash_map_drop_contents::drop_contents,
         dash_map_multi::{RefMut, get_multiple_mut},
-        dash_map_raw_entry::{TryRemove, try_remove},
+        dash_map_raw_entry::{TryLockAndRemove, try_lock_and_remove},
     },
 };
 
@@ -54,6 +55,34 @@ impl std::ops::AddAssign for EvictionCounts {
         for i in 0..UnevictableReason::COUNT {
             self.unevictable_reasons[i] += rhs.unevictable_reasons[i];
         }
+    }
+}
+
+impl Display for EvictionCounts {
+    /// Compact `field=value,...` form used as a single tracing span field so that
+    /// adding a new counter or `UnevictableReason` variant doesn't require updating
+    /// the span field list.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let skipped: usize = self.unevictable_reasons.iter().sum();
+        write!(
+            f,
+            "task_cache_evictions={},full={},data_and_meta={},data_only={},meta_only={},skipped={}",
+            self.key_evictions,
+            self.full,
+            self.data_and_meta,
+            self.data_only,
+            self.meta_only,
+            skipped,
+        )?;
+        for reason in UnevictableReason::ALL {
+            write!(
+                f,
+                ",{}={}",
+                reason.span_name(),
+                self.unevictable_reasons[reason.index()],
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -424,15 +453,7 @@ impl Storage {
             "evict_after_snapshot",
             total_task_cache_keys = self.task_cache.len(),
             total_map_keys = self.map.len(),
-            task_cache_evictions = tracing::field::Empty,
-            full = tracing::field::Empty,
-            data_and_meta = tracing::field::Empty,
-            data_only = tracing::field::Empty,
-            meta_only = tracing::field::Empty,
-            skipped = tracing::field::Empty,
-            skipped_in_progress = tracing::field::Empty,
-            skipped_modified = tracing::field::Empty,
-            skipped_nothing_to_evict = tracing::field::Empty,
+            counts = tracing::field::Empty,
         )
         .entered();
         debug_assert!(
@@ -453,6 +474,7 @@ impl Storage {
                 // SAFETY: The write lock guard outlives the bucket reference.
                 let (task_id, task) = unsafe { bucket.as_mut() };
                 if task_id.is_transient() {
+                    evicted.unevictable_reasons[UnevictableReason::Transient.index()] += 1;
                     continue;
                 }
                 let (key_evictability, value_evictability) = task.get().evictability();
@@ -462,15 +484,19 @@ impl Storage {
                         // so task_cache is a pure perf cache. Remove it now; it will be
                         // re-populated by task_by_type() on the next cache miss.
                         let task_type = task.get().get_persistent_task_type().unwrap();
-                        match try_remove(&self.task_cache, task_type.as_ref()) {
-                            TryRemove::Removed => {
+                        // Only try to acquire the lock, if we cannot just remove at the end
+                        // Because `get_or_create_task` acquires 'task_cache' then `storage.map` and
+                        // we do the opposite we need to be defensive here.  Attempting here is just
+                        // an optimization to avoid pushing into `deferred_task_cache_removals`
+                        match try_lock_and_remove(&self.task_cache, task_type.as_ref()) {
+                            TryLockAndRemove::Removed => {
                                 evicted.key_evictions += 1;
                             }
-                            TryRemove::NotFound => {
+                            TryLockAndRemove::NotFound => {
                                 // Generally this should be rare, it more or less implies something
                                 // else is concurrently holding the Arc
                             }
-                            TryRemove::WouldBlock => {
+                            TryLockAndRemove::WouldBlock => {
                                 // Contention, to avoid a deadlock just defer
                                 deferred_task_cache_removals.push(task_type.clone());
                             }
@@ -528,17 +554,7 @@ impl Storage {
         if totals.key_evictions > self.task_cache.len() {
             self.task_cache.shrink_to_fit();
         }
-        let reasons = &totals.unevictable_reasons;
-        let skipped: usize = reasons.iter().sum();
-        span.record("task_cache_evictions", totals.key_evictions);
-        span.record("full", totals.full);
-        span.record("data_and_meta", totals.data_and_meta);
-        span.record("data_only", totals.data_only);
-        span.record("meta_only", totals.meta_only);
-        span.record("skipped", skipped);
-        for reason in UnevictableReason::ALL {
-            span.record(reason.span_name(), reasons[reason.index()]);
-        }
+        span.record("counts", tracing::field::display(&totals));
 
         totals
     }

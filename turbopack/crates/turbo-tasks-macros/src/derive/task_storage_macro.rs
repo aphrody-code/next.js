@@ -1084,18 +1084,21 @@ fn generate_lazy_field_enum(grouped_fields: &GroupedFields) -> TokenStream {
         quote! { matches!(self, #(#data_patterns)|*) }
     };
 
-    // (discriminant, is_persistent) arms for the restore prescan — each
+    // (discriminant, is_meta, is_data) arms for the restore prescan — each
     // variant maps to its position in the enum definition (used as a
-    // fixed-size array offset) paired with its persistence bit.
-    let index_and_persistence_arms: Vec<_> = all_lazy_fields
+    // fixed-size array offset) paired with its category bits. Transient
+    // variants have both category bits false; persistent variants set
+    // exactly one. `is_meta || is_data` therefore doubles as `is_persistent`.
+    let index_and_category_arms: Vec<_> = all_lazy_fields
         .iter()
         .enumerate()
         .map(|(idx, field)| {
             let variant_name = &field.variant_name;
             let idx = idx as u8;
-            let is_persistent = !field.is_transient();
+            let is_meta = field.category == Category::Meta;
+            let is_data = field.category == Category::Data;
             quote! {
-                LazyField::#variant_name(_) => (#idx, #is_persistent)
+                LazyField::#variant_name(_) => (#idx, #is_meta, #is_data)
             }
         })
         .collect();
@@ -1152,15 +1155,19 @@ fn generate_lazy_field_enum(grouped_fields: &GroupedFields) -> TokenStream {
                 #is_data_body
             }
 
-            #[doc = "Variant index paired with whether this variant is persistent."]
+            #[doc = "Variant index paired with its category bits."]
             #[doc = ""]
             #[doc = "Index is the variant's position in the LazyField enum"]
             #[doc = "definition, usable as an array offset of size `NUM_VARIANTS`."]
+            #[doc = "The two bools report the variant's category: transient"]
+            #[doc = "variants have both false, persistent variants set exactly"]
+            #[doc = "one (so `is_meta || is_data` is equivalent to `is_persistent`)."]
             #[doc = "Used by the restore prescan to answer both \"where does this"]
-            #[doc = "variant live?\" and \"do we care about it?\" in a single match."]
-            const fn index_and_persistence(&self) -> (u8, bool) {
+            #[doc = "variant live?\" and \"which category's residue does it count"]
+            #[doc = "toward?\" in a single match."]
+            const fn index_and_category(&self) -> (u8, bool, bool) {
                 match self {
-                    #(#index_and_persistence_arms),*
+                    #(#index_and_category_arms),*
                 }
             }
         }
@@ -2867,7 +2874,21 @@ fn gen_drop_lazy_match_arm(field: &FieldInfo) -> TokenStream {
             LazyField::#variant_name(_) => false,
         };
     }
-    let body = gen_keep_residue_body(field, quote! { v });
+    let body = {
+        let v = quote! { v };
+        if let StorageType::Direct = field.storage_type {
+            unreachable!("lazy direct fields with filter_transient are not supported");
+        }
+        let (any_pred, retain_call) = gen_transient_scan_exprs(field, &v);
+        quote! {
+            if !(#v).iter().any(#any_pred) {
+                false
+            } else {
+                #retain_call;
+                !(#v).is_empty()
+            }
+        }
+    };
     quote! {
         LazyField::#variant_name(v) => {
             #body
@@ -2884,90 +2905,46 @@ fn gen_drop_lazy_match_arm(field: &FieldInfo) -> TokenStream {
 /// present → wholesale reset to default) and falls back to `retain` only when
 /// transient residue exists.
 fn gen_drop_filter_transient(field: &FieldInfo, target: TokenStream) -> TokenStream {
-    match field.storage_type {
-        StorageType::Direct => {
-            // Inline direct filter_transient fields are `Option<T>` where `T`
-            // has `is_transient()`. Only keep it if `Some(v)` with `v.is_transient()`.
-            quote! {
-                if !(#target).as_ref().is_some_and(|v| v.is_transient()) {
-                    #target = None;
-                }
+    if let StorageType::Direct = field.storage_type {
+        // Inline direct filter_transient fields are `Option<T>` where `T` has
+        // `is_transient()`. Keep only `Some(v)` with `v.is_transient()`.
+        return quote! {
+            if !(#target).as_ref().is_some_and(|v| v.is_transient()) {
+                #target = None;
             }
+        };
+    }
+    let (any_pred, retain_call) = gen_transient_scan_exprs(field, &target);
+    quote! {
+        if !(#target).iter().any(#any_pred) {
+            #target = Default::default();
+        } else {
+            #retain_call;
         }
-        StorageType::AutoSet => {
-            quote! {
-                if !(#target).iter().any(|k| k.is_transient()) {
-                    #target = Default::default();
-                } else {
-                    (#target).retain(|k| k.is_transient());
-                }
-            }
-        }
-        StorageType::CounterMap => {
-            quote! {
-                if !(#target).iter().any(|(k, _)| k.is_transient()) {
-                    #target = Default::default();
-                } else {
-                    (#target).retain(|k, _| k.is_transient());
-                }
-            }
-        }
-        StorageType::AutoMap => {
-            quote! {
-                if !(#target).iter().any(|(k, v)| k.is_transient() || v.is_transient()) {
-                    #target = Default::default();
-                } else {
-                    (#target).retain(|k, v| k.is_transient() || v.is_transient());
-                }
-            }
-        }
-        StorageType::Flag => unreachable!("flag fields cannot be filter_transient"),
     }
 }
 
-/// Emit the `retain_mut` closure body for a lazy `filter_transient` variant.
+/// Shared closure shapes for "does this collection contain any transient
+/// entries?" and "retain only the transient entries".
 ///
-/// `v` binds to `&mut T` where `T` is the inner collection. Returns `true`
-/// (keep variant with transient residue) or `false` (fully drop).
-fn gen_keep_residue_body(field: &FieldInfo, v: TokenStream) -> TokenStream {
+/// `.iter()` and `.retain()` take different closure signatures for map types
+/// (tuple-reference vs two separate references), so both predicates are
+/// generated together per storage type. Returns `(any_pred, retain_call)`.
+fn gen_transient_scan_exprs(field: &FieldInfo, target: &TokenStream) -> (TokenStream, TokenStream) {
     match field.storage_type {
-        StorageType::Direct => {
-            // Lazy + direct doesn't make sense in practice: direct fields are
-            // always inline in the current schema. If one is ever added with
-            // `filter_transient`, the right design is to push it to `inline`
-            // or revisit this path explicitly.
-            panic!("lazy direct fields with filter_transient are not supported");
-        }
-        StorageType::AutoSet => {
-            quote! {
-                if !(#v).iter().any(|k| k.is_transient()) {
-                    false
-                } else {
-                    (#v).retain(|k| k.is_transient());
-                    !(#v).is_empty()
-                }
-            }
-        }
-        StorageType::CounterMap => {
-            quote! {
-                if !(#v).iter().any(|(k, _)| k.is_transient()) {
-                    false
-                } else {
-                    (#v).retain(|k, _| k.is_transient());
-                    !(#v).is_empty()
-                }
-            }
-        }
-        StorageType::AutoMap => {
-            quote! {
-                if !(#v).iter().any(|(k, v2)| k.is_transient() || v2.is_transient()) {
-                    false
-                } else {
-                    (#v).retain(|k, v2| k.is_transient() || v2.is_transient());
-                    !(#v).is_empty()
-                }
-            }
-        }
+        StorageType::AutoSet => (
+            quote! { |k| k.is_transient() },
+            quote! { (#target).retain(|k| k.is_transient()) },
+        ),
+        StorageType::CounterMap => (
+            quote! { |(k, _)| k.is_transient() },
+            quote! { (#target).retain(|k, _| k.is_transient()) },
+        ),
+        StorageType::AutoMap => (
+            quote! { |(k, v)| k.is_transient() || v.is_transient() },
+            quote! { (#target).retain(|k, v| k.is_transient() || v.is_transient()) },
+        ),
+        StorageType::Direct => unreachable!("direct fields handled by caller"),
         StorageType::Flag => unreachable!("flag fields cannot be filter_transient"),
     }
 }
@@ -3634,16 +3611,18 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
 
                 #restore_meta_flags
 
-                // Cold path when `self.lazy` has no persistent residue: bulk
-                // extend. Otherwise build a discriminant → position index and
-                // merge each source variant in O(1).
-                match Self::build_lazy_index(&self.lazy) {
-                    None => self.lazy.extend(source.lazy),
-                    Some(index) => {
-                        for field in source.lazy {
-                            debug_assert!(field.is_persistent());
-                            self.restore_lazy_field(field, &index);
-                        }
+                // `source.lazy` contains only persistent meta variants. If
+                // `self.lazy` has no persistent meta residue we can bulk-extend
+                // regardless of transient or data residue — those can't collide
+                // with the incoming meta variants. Otherwise build the index
+                // and merge each source variant in O(1).
+                let (any_meta, _any_data, index) = Self::build_lazy_index(&self.lazy);
+                if !any_meta {
+                    self.lazy.extend(source.lazy);
+                } else {
+                    for field in source.lazy {
+                        debug_assert!(field.is_persistent() && field.is_meta());
+                        self.restore_lazy_field(field, &index);
                     }
                 }
             }
@@ -3658,67 +3637,50 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
 
                 #restore_data_flags
 
-                match Self::build_lazy_index(&self.lazy) {
-                    None => self.lazy.extend(source.lazy),
-                    Some(index) => {
-                        for field in source.lazy {
-                            debug_assert!(field.is_persistent());
-                            self.restore_lazy_field(field, &index);
-                        }
+                // Mirror image of `restore_meta_from`: `source.lazy` contains
+                // only persistent data variants, so meta or transient residue
+                // in `self.lazy` is never a collision risk.
+                let (_any_meta, any_data, index) = Self::build_lazy_index(&self.lazy);
+                if !any_data {
+                    self.lazy.extend(source.lazy);
+                } else {
+                    for field in source.lazy {
+                        debug_assert!(field.is_persistent() && field.is_data());
+                        self.restore_lazy_field(field, &index);
                     }
                 }
             }
 
-            /// Restore all fields from source (both meta and data).
+
+            /// Build a discriminant → position lookup table over `lazy`, plus
+            /// per-category "any persistent residue?" bits.
             ///
-            /// `self` may contain transient residue left behind by `drop_partial`;
-            /// `filter_transient` fields are merged rather than overwritten.
-            fn restore_all_from(&mut self, source: TaskStorage) {
-                // Inline meta fields
-                #(#restore_meta_inline)*
-
-                // Inline data fields
-                #(#restore_data_inline)*
-
-                #restore_all_flags
-
-                match Self::build_lazy_index(&self.lazy) {
-                    None => self.lazy.extend(source.lazy),
-                    Some(index) => {
-                        for field in source.lazy {
-                            debug_assert!(field.is_persistent());
-                            self.restore_lazy_field(field, &index);
-                        }
-                    }
-                }
-            }
-
-            /// Build a discriminant → position lookup table over `lazy`.
+            /// The bits let each restore entry point skip per-field dispatch
+            /// when its category has no residue to collide with — e.g.
+            /// `restore_meta_from` only cares about meta residue, since the
+            /// incoming source is all meta. A cold restore after a
+            /// `restore_meta_from` + `drop_partial(data)` can still have data
+            /// residue present but not collide with the incoming meta source,
+            /// so the data bit staying false lets meta restore stay on the
+            /// bulk-extend fast path.
             ///
-            /// Returns `None` if `lazy` contains no persistent entries — the hot
-            /// path for cold restores, where the caller can skip per-field
-            /// dispatch and bulk-extend directly. `Some(index)` is returned
-            /// only when persistent residue is present; `u8::MAX` marks
-            /// "variant not present".
-            ///
-            /// Relies on `lazy.len() < 255`, which is trivially true (at most
+            /// `u8::MAX` marks "variant not present" in the index. Relies on
+            /// `lazy.len() < 255`, which is trivially true (at most
             /// `LazyField::NUM_VARIANTS` entries, well under 255).
             fn build_lazy_index(
                 lazy: &[LazyField],
-            ) -> Option<[u8; LazyField::NUM_VARIANTS]> {
+            ) -> (bool, bool, [u8; LazyField::NUM_VARIANTS]) {
                 debug_assert!(lazy.len() < u8::MAX as usize);
-                // Fast path: fresh task with no residue at all.
-                if lazy.is_empty() {
-                    return None;
-                }
                 let mut index = [u8::MAX; LazyField::NUM_VARIANTS];
-                let mut any_persistent = false;
+                let mut any_meta = false;
+                let mut any_data = false;
                 for (i, f) in lazy.iter().enumerate() {
-                    let (d, is_persistent) = f.index_and_persistence();
+                    let (d, is_meta, is_data) = f.index_and_category();
                     index[d as usize] = i as u8;
-                    any_persistent |= is_persistent;
+                    any_meta |= is_meta;
+                    any_data |= is_data;
                 }
-                any_persistent.then_some(index)
+                (any_meta, any_data, index)
             }
 
             /// Merge a single persistent `LazyField` from a decoded snapshot into

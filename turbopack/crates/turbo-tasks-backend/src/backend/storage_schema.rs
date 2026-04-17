@@ -445,6 +445,8 @@ pub enum UnevictableReason {
     InProgress,
     /// Modified flags are set, or data/meta has not been restored yet.
     Modified,
+    /// The task is transient
+    Transient,
     // Keep `NothingToEvict` last: `COUNT` is derived from its discriminant.
     NothingToEvict,
 }
@@ -455,6 +457,7 @@ impl UnevictableReason {
     pub const ALL: [UnevictableReason; Self::COUNT] = [
         UnevictableReason::InProgress,
         UnevictableReason::Modified,
+        UnevictableReason::Transient,
         UnevictableReason::NothingToEvict,
     ];
 
@@ -473,6 +476,7 @@ impl UnevictableReason {
         match self {
             UnevictableReason::InProgress => "skipped_in_progress",
             UnevictableReason::Modified => "skipped_modified",
+            UnevictableReason::Transient => "skipped_transient",
             UnevictableReason::NothingToEvict => "skipped_nothing_to_evict",
         }
     }
