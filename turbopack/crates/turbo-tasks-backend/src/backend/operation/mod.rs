@@ -1348,12 +1348,12 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
     fn get_task_desc_fn(&self) -> impl Fn() -> String + Send + Sync + 'static {
         let task_type = self.get_task_type().to_owned();
         let task_id = self.id();
-        move || format!("{task_id:?} {task_type:?}")
+        move || format!("{task_id:?} {task_type}")
     }
     fn get_task_description(&self) -> String {
         let task_type = self.get_task_type().to_owned();
         let task_id = self.id();
-        format!("{task_id:?} {task_type:?}")
+        format!("{task_id:?} {task_type}")
     }
     fn get_task_name(&self) -> String {
         let task_type = self.get_task_type().to_owned();

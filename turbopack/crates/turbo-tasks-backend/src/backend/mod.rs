@@ -27,10 +27,10 @@ use tokio::time::{Duration, Instant};
 use tracing::{Span, trace_span};
 use turbo_bincode::{TurboBincodeBuffer, new_turbo_bincode_decoder, new_turbo_bincode_encoder};
 use turbo_tasks::{
-    CellId, FxDashMap, RawVc, ReadCellOptions, ReadCellTracking, ReadConsistency,
-    ReadOutputOptions, ReadTracking, SharedReference, StackDynTaskInputs, TRANSIENT_TASK_BIT,
-    TaskExecutionReason, TaskId, TaskPersistence, TaskPriority, TraitTypeId, TurboTasksBackendApi,
-    TurboTasksPanic, ValueTypeId,
+    CellId, RawVc, ReadCellOptions, ReadCellTracking, ReadConsistency, ReadOutputOptions,
+    ReadTracking, SharedReference, StackDynTaskInputs, TRANSIENT_TASK_BIT, TaskExecutionReason,
+    TaskId, TaskPersistence, TaskPriority, TraitTypeId, TurboTasksBackendApi, TurboTasksPanic,
+    ValueTypeId,
     backend::{
         Backend, CachedTaskType, CellContent, CellHash, TaskExecutionSpec, TransientTaskType,
         TurboTaskContextError, TurboTaskLocalContextError, TurboTasksError,
@@ -72,11 +72,7 @@ use crate::{
     },
     error::TaskError,
     utils::{
-        arc_or_owned::ArcOrOwned,
-        dash_map_drop_contents::drop_contents,
-        dash_map_raw_entry::{
-            RawEntry, get_shard, raw_entry, raw_entry_in_shard, raw_get_in_shard,
-        },
+        dash_map_raw_entry::{RawEntry, get_shard, raw_entry_in_shard, raw_get_in_shard},
         ptr_eq_arc::PtrEqArc,
         shard_amount::compute_shard_amount,
     },
@@ -198,7 +194,6 @@ struct TurboTasksBackendInner<B: BackingStorage> {
     /// Condition Variable that is triggered when a snapshot is completed and
     /// operations can continue.
     snapshot_completed: Condvar,
-    /// The timestamp of the last started snapshot since [`Self::start_time`].
     stopping: AtomicBool,
     stopping_event: Event,
     idle_start_event: Event,
@@ -1585,7 +1580,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         // Compute hash and shard index once from borrowed components (no heap allocation).
         let arg_ref = arg.as_ref();
         let hash = CachedTaskType::hash_from_components(
-            self.task_cache.hasher(),
+            self.storage.task_cache.hasher(),
             native_fn,
             this,
             arg_ref,
@@ -1593,7 +1588,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         // Locate the shard once so that the read-only lookup and any
         // write-lock retry below share the same reference (saves a modulo +
         // memory lookup on the miss path).
-        let shard = get_shard(&self.task_cache, hash);
+        let shard = get_shard(&self.storage.task_cache, hash);
 
         // Step 1: Fast read-only cache lookup (read lock, no allocation).
         // Use a read lock rather than a write lock to avoid contention. connect_child
@@ -1619,7 +1614,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             self.track_cache_hit_by_fn(native_fn);
             // Step 3a: Insert into in-memory cache using the pre-located shard.
             // Use the existing Arc from storage to avoid a duplicate allocation.
-            match raw_entry_in_shard(shard, self.task_cache.hasher(), hash, |k| {
+            match raw_entry_in_shard(shard, self.storage.task_cache.hasher(), hash, |k| {
                 k.eq_components(native_fn, this, arg_ref)
             }) {
                 RawEntry::Occupied(_) => {}
@@ -1629,7 +1624,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             };
             task_id
         } else {
-            match raw_entry_in_shard(shard, self.task_cache.hasher(), hash, |k| {
+            match raw_entry_in_shard(shard, self.storage.task_cache.hasher(), hash, |k| {
                 k.eq_components(native_fn, this, arg_ref)
             }) {
                 RawEntry::Occupied(e) => {
@@ -2821,7 +2816,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                     let mut fresh_idle = true;
                     let mut evicted = false;
                     let mut is_first = true;
-                    loop {
+                    'outer: loop {
                         const FIRST_SNAPSHOT_WAIT: Duration = Duration::from_secs(300);
                         const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(120);
                         let idle_timeout = *IDLE_TIMEOUT;
@@ -2883,8 +2878,11 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                 return;
                             }
                             Ok((snapshot_start, new_data)) => {
-                                last_snapshot = snapshot_start;
+                                if !new_data {
+                                    fresh_idle = false;
+                                }
                                 is_first = false;
+                                last_snapshot = snapshot_start;
 
                                 // Polls the idle-end event without blocking. Returns
                                 // `true` and refreshes the listener if idle has ended,
@@ -2918,38 +2916,16 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                 // (data was already on disk from a prior run, so
                                 // new_data may be false but in-memory state can still
                                 // be evicted).
-                                if this.should_evict()
-                                    && (new_data || !evicted)
-                                    && !check_idle_ended!()
-                                {
+                                let mut ran_eviction = false;
+                                if this.should_evict() && (new_data || !evicted) {
+                                    if check_idle_ended!() {
+                                        // need to start all the way over so we catch the next
+                                        // signal
+                                        continue 'outer;
+                                    }
                                     evicted = true;
+                                    ran_eviction = true;
                                     this.storage.evict_after_snapshot(background_span.id());
-
-                                    // Defer a full mimalloc GC until blocking
-                                    // threads have had time to exit and release
-                                    // their thread-local free lists. The delay
-                                    // matches tokio's thread_keep_alive default.
-                                    // Cancel if idle ends before the timer fires.
-                                    let backend = self.clone();
-                                    tokio::task::spawn(async move {
-                                        /// Tokio's blocking thread pool retires idle threads
-                                        /// after `thread_keep_alive` (default 10s); we wait at
-                                        /// least that long sot hose threads have exited and flushed
-                                        /// their mimalloc thread-local freel lists back to the
-                                        /// global pool before the cross-thread collection runs.
-                                        /// Tokio does not expose a getter for this value on the
-                                        /// runtime handle, so we mirror its default here. If the
-                                        /// runtime is configured with a different keep-alive, this
-                                        /// constant should be updated to match.
-                                        const POST_EVICTION_GC_DELAY: Duration =
-                                            Duration::from_secs(10);
-                                        tokio::select! {
-                                            _ = tokio::time::sleep(POST_EVICTION_GC_DELAY) => {
-                                                turbo_tasks_malloc::TurboMalloc::collect(true);
-                                            }
-                                            _ = backend.idle_end_event.listen() => {}
-                                        }
-                                    });
                                 }
 
                                 // Compact while idle (up to limit), regardless of
@@ -2958,10 +2934,11 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                 // `EnteredSpan` is `!Send` and would prevent the
                                 // future from being sent across threads when it
                                 // suspends at the `select!` await below.
+                                let mut ran_compaction = false;
                                 const MAX_IDLE_COMPACTION_PASSES: usize = 10;
                                 for _ in 0..MAX_IDLE_COMPACTION_PASSES {
                                     if check_idle_ended!() {
-                                        break;
+                                        continue 'outer;
                                     }
                                     // Enter the span only around the synchronous
                                     // compact() call so we never hold an
@@ -2972,7 +2949,9 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                     )
                                     .entered();
                                     match self.backing_storage.compact() {
-                                        Ok(true) => {}
+                                        Ok(true) => {
+                                            ran_compaction = true;
+                                        }
                                         Ok(false) => break,
                                         Err(err) => {
                                             eprintln!("Compaction failed: {err:?}");
@@ -2985,11 +2964,16 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                         }
                                     }
                                 }
-
-                                if !new_data {
-                                    fresh_idle = false;
+                                if check_idle_ended!() {
+                                    continue 'outer;
                                 }
-                                continue;
+                                // After running snapshotting/eviction/compaction we have churned a
+                                // _lot_ of memory if we are still
+                                // idle tell `mimalloc` that now would be a good time to release
+                                // memory back to the OS
+                                if new_data || ran_compaction || ran_eviction {
+                                    turbo_tasks_malloc::TurboMalloc::collect(true);
+                                }
                             }
                         }
                     }
@@ -3855,6 +3839,15 @@ impl fmt::Display for DebugTraceTransientTask {
     }
 }
 
+// from https://github.com/tokio-rs/tokio/blob/29cd6ec1ec6f90a7ee1ad641c03e0e00badbcb0e/tokio/src/time/instant.rs#L57-L63
+fn far_future() -> Instant {
+    // Roughly 30 years from now.
+    // API does not provide a way to obtain max `Instant`
+    // or convert specific date in the future to instant.
+    // 1000 years overflows on macOS, 100 years overflows on FreeBSD.
+    Instant::now() + Duration::from_secs(86400 * 365 * 30)
+}
+
 /// Encodes task data, using the provided buffer as a scratch space.  Returns a new exactly sized
 /// buffer.
 /// This allows reusing the buffer across multiple encode calls to optimize allocations and
@@ -3864,15 +3857,6 @@ impl fmt::Display for DebugTraceTransientTask {
 /// fallible encoding. In practice, encoding to a `SmallVec` is infallible (no I/O), and the only
 /// real failure mode — a `TypedSharedReference` whose value type has no bincode impl — is a
 /// programmer error caught by the panic in the caller. Consider making the bincode encoding trait
-// from https://github.com/tokio-rs/tokio/blob/29cd6ec1ec6f90a7ee1ad641c03e0e00badbcb0e/tokio/src/time/instant.rs#L57-L63
-fn far_future() -> Instant {
-    // Roughly 30 years from now. Used as a "timer disabled" sentinel.
-    // API does not provide a way to obtain max `Instant`
-    // or convert specific date in the future to instant.
-    // 1000 years overflows on macOS, 100 years overflows on FreeBSD.
-    Instant::now() + Duration::from_secs(86400 * 365 * 30)
-}
-
 /// infallible (i.e. returning `()` instead of `Result<(), EncodeError>`) to eliminate the
 /// spurious `Result` threading throughout the encode path.
 fn encode_task_data(

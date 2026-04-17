@@ -209,11 +209,9 @@ pub enum EnvVarTracking {
     Untracked,
 }
 
-#[turbo_tasks::function(operation, session_stateful)]
+#[turbo_tasks::function(operation)]
 /// Pass the file you cared as `runtime_entries` to invalidate and reload the
 /// evaluated result automatically.
-///
-/// This is `session_stateful` to ensure the worker pool stays alive during eviction
 pub async fn get_evaluate_pool(
     entries: ResolvedVc<EvaluateEntries>,
     cwd: FileSystemPath,

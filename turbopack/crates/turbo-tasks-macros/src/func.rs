@@ -733,9 +733,6 @@ pub struct FunctionArguments {
     /// Should the task be marked as a root in the aggregation graph on initial creation?
     /// Root tasks start with aggregation number `u32::MAX`.
     pub root: Option<Span>,
-    /// Should tasks of this function be excluded from eviction (i.e. they hold session-local
-    /// state that cannot be reconstructed from disk)?
-    pub session_stateful: Option<Span>,
 }
 
 impl Parse for FunctionArguments {
@@ -763,14 +760,11 @@ impl Parse for FunctionArguments {
                 ("root", Meta::Path(_)) => {
                     parsed_args.root = Some(meta.span());
                 }
-                ("session_stateful", Meta::Path(_)) => {
-                    parsed_args.session_stateful = Some(meta.span());
-                }
                 (_, meta) => {
                     return Err(syn::Error::new_spanned(
                         meta,
                         "unexpected token, expected one of: \"fs\", \"network\", \"operation\", \
-                         \"root\", or \"session_stateful\"",
+                         or \"root\"",
                     ));
                 }
             }
@@ -1097,7 +1091,6 @@ pub struct NativeFn {
     pub is_self_used: bool,
     pub filter_trait_call_args: Option<FilterTraitCallArgsTokens>,
     pub is_root: bool,
-    pub is_session_stateful: bool,
 }
 
 impl NativeFn {
@@ -1114,7 +1107,6 @@ impl NativeFn {
             is_self_used,
             filter_trait_call_args,
             is_root,
-            is_session_stateful,
         } = self;
 
         let task_fn = if *is_method && *is_self_used {
@@ -1150,7 +1142,6 @@ impl NativeFn {
                     #arg_meta,
                     &#task_fn,
                     #is_root,
-                    #is_session_stateful,
                 )
             }
         }

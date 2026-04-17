@@ -439,31 +439,59 @@ impl TaskFlags {
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum UnevictableReason {
+    // Either in progress or soon to be inprogress
     InProgress,
-    Restoring,
     /// Modified flags are set, or data/meta has not been restored yet.
     Modified,
-    /// Transient references or session-stateful cells are present (detected without
+    /// Transient references or transient cell data are present (detected without
     /// re-running the expensive per-field checks).
-    TransientOrStateful,
+    Transient,
+    // Keep `NothingToEvict` last: `COUNT` is derived from its discriminant.
     NothingToEvict,
+}
+
+impl UnevictableReason {
+    /// All variants in discriminant order. Keep this in sync when adding variants —
+    /// iteration and indexing rely on it covering every case.
+    pub const ALL: [UnevictableReason; Self::COUNT] = [
+        UnevictableReason::InProgress,
+        UnevictableReason::Modified,
+        UnevictableReason::Transient,
+        UnevictableReason::NothingToEvict,
+    ];
+
+    /// Number of variants. Derived from the last variant's discriminant, so adding a
+    /// new variant before `NothingToEvict` stays correct automatically.
+    pub const COUNT: usize = (UnevictableReason::NothingToEvict as usize) + 1;
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable name used as a tracing span field. Matches the snake_case convention
+    /// of the other span fields in `evict_after_snapshot`.
+    pub const fn span_name(self) -> &'static str {
+        match self {
+            UnevictableReason::InProgress => "skipped_in_progress",
+            UnevictableReason::Modified => "skipped_modified",
+            UnevictableReason::Transient => "skipped_transient",
+            UnevictableReason::NothingToEvict => "skipped_nothing_to_evict",
+        }
+    }
 }
 
 /// Eviction level for a task after a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueEvictability {
     /// Task cannot be evicted.
-    No(UnevictableReason),
-    /// Only the data category can be evicted (meta is still in use).
-    DataOnly,
-    /// Only the meta category can be evicted (data is still in use).
-    MetaOnly,
-    /// Both data and meta can be evicted, but the task must stay in the storage
-    /// map because it has meaningful transient state.
-    DataAndMeta,
-    /// The entire task can be evicted (removed from the storage map).
-    Full,
+    Unevictable(UnevictableReason),
+    Evictable {
+        meta: bool,
+        data: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,37 +535,39 @@ impl TaskStorage {
             }
         };
         // === Absolute blockers ===
-        if flags.new_task()
-            || self.get_in_progress().is_some()
+        if flags.new_task() {
+            return (
+                key_evictability,
+                ValueEvictability::Unevictable(UnevictableReason::Modified),
+            );
+        }
+        // All these flags imply that the task is currently being used in some way
+        // either literally executing, or about to
+        if self.get_in_progress().is_some()
             || self.get_activeness().is_some()
-            || self.get_transient_task_type().is_some()
+            // Without these checks we could corrupt racing reads.
+            // Basically if a task restores ALL but data is already restored, then it will set meta_restoring, so it would break semantics to clear data_restored while that is happening.  We could fix it by adding a loop to the restoring threads but it is just much simpler to back off in this case.
+            || flags.meta_restoring()
+            || flags.data_restoring()
         {
             return (
                 key_evictability,
-                ValueEvictability::No(UnevictableReason::InProgress),
+                ValueEvictability::Unevictable(UnevictableReason::InProgress),
             );
         }
-
-        // Back off if another thread is currently restoring this task's data from
-        // disk. Without this check, eviction could clear data that was already
-        // determined to be "restored" by the restoring thread (which released the
-        // lock to do I/O), causing the restoring thread to skip re-reading it.  Instead we respect
-        // in flight restoration
-        if flags.meta_restoring() || flags.data_restoring() {
-            return (
-                key_evictability,
-                ValueEvictability::No(UnevictableReason::Restoring),
-            );
-        }
+        debug_assert!(
+            self.get_transient_task_type().is_none(),
+            "only transient tasks can have transient_task_types so it cannot be set here"
+        );
 
         // This is common after a round of eviction we end up with tasks with only transient state
         // There is no need to search for it, we can just assume any task in this state is preserved
-        // for a reason.  NOTE: new tasks have the restored flags set as part of construction so the
-        // only way for a task to end up in this situation is through eviction
+        // for some reason.  NOTE: new tasks have the restored flags set as part of construction so
+        // the only way for a task to end up in this situation is through eviction
         if !flags.data_restored() && !flags.meta_restored() {
             return (
                 key_evictability,
-                ValueEvictability::No(UnevictableReason::NothingToEvict),
+                ValueEvictability::Unevictable(UnevictableReason::NothingToEvict),
             );
         }
 
@@ -554,10 +584,7 @@ impl TaskStorage {
             && self
                 .cell_dependents()
                 .is_none_or(|cd| !cd.iter().any(|(_, _, t)| t.is_transient()))
-            && !self.output_dependent().iter().any(|d|d.is_transient())
-            // If the task function is session_stateful, its output cannot be safely evicted
-            && self.persistent_task_type.as_ref()
-                .map_or(true, |t| !t.native_fn.is_session_stateful);
+            && !self.output_dependent().iter().any(|d|d.is_transient());
 
         // === Meta evictability (independent) ===
         // Meta can be dropped if it's been restored from disk, hasn't been modified,
@@ -580,34 +607,6 @@ impl TaskStorage {
         (
             key_evictability,
             match (data_evictable, meta_evictable) {
-                (true, true) => {
-                    // Full eviction removes the task from the storage map entirely,
-                    // losing all transient state. Only safe when no meaningful
-                    // transient state exists beyond what data_evictable/meta_evictable
-                    // already checked (transient dependents, session-stateful cells,
-                    // transient cell data, transient output are already false here).
-                    // Remaining transient state not already covered by
-                    // data_evictable / meta_evictable:
-                    // - current_session_clean: if true, losing it would make a SessionDependent
-                    //   task appear dirty after restore. If false + SessionDependent dirty, the
-                    //   task is already logically dirty so restoring reproduces the same state.
-                    // - aggregated session-clean counts: used by has_dirty_containers(); losing
-                    //   them breaks that check.
-                    let has_meaningful_transient = flags.current_session_clean()
-                        || self
-                            .get_aggregated_current_session_clean_container_count()
-                            .is_some_and(|&c| c != 0)
-                        || self
-                            .aggregated_current_session_clean_containers()
-                            .is_some_and(|c| !c.is_empty());
-                    if has_meaningful_transient {
-                        ValueEvictability::DataAndMeta
-                    } else {
-                        ValueEvictability::Full
-                    }
-                }
-                (true, false) => ValueEvictability::DataOnly,
-                (false, true) => ValueEvictability::MetaOnly,
                 (false, false) => {
                     // Cheap flags checked first; if those are clear the blocker must
                     // be one of the expensive transient/stateful checks above.
@@ -618,12 +617,16 @@ impl TaskStorage {
                     {
                         UnevictableReason::Modified
                     } else {
-                        // Transient references, transient cell data, or session-stateful
-                        // cells are blocking — don't repeat the expensive checks.
-                        UnevictableReason::TransientOrStateful
+                        // Transient references or transient cell data are blocking —
+                        // don't repeat the expensive checks.
+                        UnevictableReason::Transient
                     };
-                    ValueEvictability::No(reason)
+                    ValueEvictability::Unevictable(reason)
                 }
+                _ => ValueEvictability::Evictable {
+                    meta: meta_evictable,
+                    data: data_evictable,
+                },
             },
         )
     }

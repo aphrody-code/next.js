@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    hash::Hash,
+    hash::{BuildHasher, Hash},
     ops::{Deref, DerefMut},
     sync::{
         Arc,
@@ -8,7 +8,6 @@ use std::{
     },
 };
 
-use rustc_hash::{FxHashMap, FxHasher};
 use thread_local::ThreadLocal;
 use tracing::span::Id;
 use turbo_bincode::TurboBincodeBuffer;
@@ -21,6 +20,7 @@ use crate::{
     utils::{
         dash_map_drop_contents::drop_contents,
         dash_map_multi::{RefMut, get_multiple_mut},
+        dash_map_raw_entry::{TryRemove, try_remove},
     },
 };
 
@@ -39,6 +39,22 @@ pub struct EvictionCounts {
     pub data_and_meta: usize,
     pub data_only: usize,
     pub meta_only: usize,
+    /// Per-reason counts of tasks we considered but could not evict, indexed by
+    /// `UnevictableReason::index()`.
+    pub unevictable_reasons: [usize; UnevictableReason::COUNT],
+}
+
+impl std::ops::AddAssign for EvictionCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        self.key_evictions += rhs.key_evictions;
+        self.full += rhs.full;
+        self.data_and_meta += rhs.data_and_meta;
+        self.data_only += rhs.data_only;
+        self.meta_only += rhs.meta_only;
+        for i in 0..UnevictableReason::COUNT {
+            self.unevictable_reasons[i] += rhs.unevictable_reasons[i];
+        }
+    }
 }
 
 impl TaskDataCategory {
@@ -103,6 +119,12 @@ pub struct Storage {
     /// - `None`: Task was first modified during snapshot mode (not part of current snapshot). Will
     ///   be marked as modified at the beginning of the next snapshot cycle.
     snapshots: FxDashMap<TaskId, Option<Box<TaskStorage>>>,
+    /// The main storage map
+    ///
+    /// Lock Ordering: Task creation acquires a `task_cache` lock and then inserts into this map.
+    /// Because both datastructures are sharded on different keys, the locks are not 'strictly'
+    /// ordered but we should treat them as such
+    /// Acquiring locks in the opposite order should be defensive
     map: FxDashMap<TaskId, Box<TaskStorage>>,
     /// A shared event notified whenever any task finishes restoring (successfully or not).
     ///
@@ -110,9 +132,9 @@ pub struct Storage {
     /// then re-check the specific task's `restoring`/`restored` bits after waking.
     pub(crate) restored: Event,
     /// Maps `CachedTaskType` → `TaskId` for deduplication of persistent task creation.
-    /// Acts as a pure performance cache: once `new_task` is cleared (task type persisted to
-    /// backing storage), entries can be evicted and will be restored via `task_by_type()` on
-    /// next miss. Transient task entries are never evicted.
+    /// This is backed by the TaskCache table in the backend.
+    ///
+    /// LockOrdering: See the comments on [map].,
     pub task_cache: FxDashMap<Arc<CachedTaskType>, TaskId>,
 }
 
@@ -409,7 +431,6 @@ impl Storage {
             meta_only = tracing::field::Empty,
             skipped = tracing::field::Empty,
             skipped_in_progress = tracing::field::Empty,
-            skipped_restoring = tracing::field::Empty,
             skipped_modified = tracing::field::Empty,
             skipped_transient_or_stateful = tracing::field::Empty,
             skipped_nothing_to_evict = tracing::field::Empty,
@@ -420,84 +441,87 @@ impl Storage {
             "evict_after_snapshot must not be called during snapshot mode"
         );
 
-        let counts: Vec<(EvictionCounts, FxHashMap<UnevictableReason, usize>)> =
-            parallel::map_collect(self.map.shards(), |shard| {
-                let mut shard = shard.write();
-                let mut evicted = EvictionCounts::default();
-                let mut reason_counts: FxHashMap<UnevictableReason, usize> = FxHashMap::default();
-                // SAFETY: We hold the write lock for the duration of iteration.
-                for bucket in unsafe { shard.iter() } {
-                    // SAFETY: The write lock guard outlives the bucket reference.
-                    let (task_id, task) = unsafe { bucket.as_mut() };
-                    if task_id.is_transient() {
-                        continue;
-                    }
-                    let (key, data) = task.get().evictability();
-                    if matches!(key, KeyEvictability::Evictable) {
+        let counts: Vec<EvictionCounts> = parallel::map_collect(self.map.shards(), |shard| {
+            let mut shard = shard.write();
+            let mut evicted = EvictionCounts::default();
+            // task_cache removals that we couldn't perform inline because the target shard
+            // was contended. We defer them until after the map shard lock is released to
+            // avoid a lock cycle with get_or_create_persistent_task, which takes task_cache
+            // before map. Allocated lazily on first conflict.
+            let mut deferred_task_cache_removals: Vec<Arc<CachedTaskType>> = Vec::new();
+            // SAFETY: We hold the write lock for the duration of iteration.
+            for bucket in unsafe { shard.iter() } {
+                // SAFETY: The write lock guard outlives the bucket reference.
+                let (task_id, task) = unsafe { bucket.as_mut() };
+                if task_id.is_transient() {
+                    continue;
+                }
+                let (key_evictability, value_evictability) = task.get().evictability();
+                match key_evictability {
+                    KeyEvictability::Evictable => {
                         // The task type is persisted to backing storage (new_task = false),
                         // so task_cache is a pure perf cache. Remove it now; it will be
                         // re-populated by task_by_type() on the next cache miss.
-
-                        if self
-                            .task_cache
-                            .remove(task.get().get_persistent_task_type().unwrap().as_ref())
-                            .is_some()
-                        {
-                            evicted.key_evictions += 1;
+                        let task_type = task.get().get_persistent_task_type().unwrap();
+                        match try_remove(&self.task_cache, task_type.as_ref()) {
+                            TryRemove::Removed => {
+                                evicted.key_evictions += 1;
+                            }
+                            TryRemove::NotFound => {
+                                // Generally this should be rare, it more or less implies something
+                                // else is concurrently holding the Arc
+                            }
+                            TryRemove::WouldBlock => {
+                                // Contention, to avoid a deadlock just defer
+                                deferred_task_cache_removals.push(task_type.clone());
+                            }
                         }
                     }
-                    // KeyEvictability::AlreadyEvicted: strong_count == 1 means no
-                    // task_cache entry holds a reference — skip the hash lookup.
-                    match data {
-                        ValueEvictability::Full => {
+                    KeyEvictability::AlreadyEvicted | KeyEvictability::Unevictable => {}
+                }
+                match value_evictability {
+                    ValueEvictability::Evictable { meta, data } => {
+                        task.get_mut().drop_partial(data, meta);
+                        if task.get().is_empty() {
                             unsafe {
                                 shard.erase(bucket);
                             }
                             evicted.full += 1;
-                        }
-                        ValueEvictability::DataAndMeta => {
-                            task.get_mut().drop_data_and_meta();
+                        } else if data && meta {
                             evicted.data_and_meta += 1;
-                        }
-                        ValueEvictability::DataOnly => {
-                            task.get_mut().drop_data();
+                        } else if data {
                             evicted.data_only += 1;
-                        }
-                        ValueEvictability::MetaOnly => {
-                            task.get_mut().drop_meta();
+                        } else {
+                            debug_assert!(meta);
                             evicted.meta_only += 1;
                         }
-                        ValueEvictability::No(reason) => {
-                            *reason_counts.entry(reason).or_default() += 1;
-                        }
+                    }
+                    ValueEvictability::Unevictable(reason) => {
+                        evicted.unevictable_reasons[reason.index()] += 1;
                     }
                 }
-                // Shrink the shard if it's less than half full, to reclaim slack capacity
-                // after bulk evictions. We already hold the write lock, so this is free
-                // from a locking perspective. TaskId hashing is cheap (it's just an integer).
-                let len = shard.len();
-                if shard.capacity() > len * 2 {
-                    shard.shrink_to(len, |(k, _v)| {
-                        use std::hash::{Hash, Hasher};
-                        let mut h = FxHasher::default();
-                        k.hash(&mut h);
-                        h.finish()
-                    });
+            }
+            // Shrink the shard if it's less than half full, to reclaim slack capacity
+            // after bulk evictions. We already hold the write lock, so this is free
+            // from a locking perspective. TaskId hashing is cheap (it's just an integer).
+            let len = shard.len();
+            if shard.capacity() > len * 2 {
+                shard.shrink_to(len, |(k, _v)| self.map.hasher().hash_one(k));
+            }
+            // Release the map shard lock before draining deferred removals so that a thread
+            // holding a task_cache shard lock and waiting on this map shard can make progress.
+            drop(shard);
+            for task_type in deferred_task_cache_removals {
+                if self.task_cache.remove(task_type.as_ref()).is_some() {
+                    evicted.key_evictions += 1;
                 }
-                (evicted, reason_counts)
-            });
+            }
+            evicted
+        });
 
         let mut totals = EvictionCounts::default();
-        let mut reasons: FxHashMap<UnevictableReason, usize> = FxHashMap::default();
-        for (evicted, r) in counts {
-            totals.key_evictions += evicted.key_evictions;
-            totals.full += evicted.full;
-            totals.data_and_meta += evicted.data_and_meta;
-            totals.data_only += evicted.data_only;
-            totals.meta_only += evicted.meta_only;
-            for (reason, count) in r {
-                *reasons.entry(reason).or_default() += count;
-            }
+        for evicted in counts {
+            totals += evicted;
         }
         // Shrink task_cache only when we evicted more entries than remain — i.e. the map
         // is less than half full. shrink_to_fit() acquires each shard write lock in turn
@@ -505,48 +529,17 @@ impl Storage {
         if totals.key_evictions > self.task_cache.len() {
             self.task_cache.shrink_to_fit();
         }
-        let skipped: usize = reasons.values().sum();
+        let reasons = &totals.unevictable_reasons;
+        let skipped: usize = reasons.iter().sum();
         span.record("task_cache_evictions", totals.key_evictions);
         span.record("full", totals.full);
         span.record("data_and_meta", totals.data_and_meta);
         span.record("data_only", totals.data_only);
         span.record("meta_only", totals.meta_only);
         span.record("skipped", skipped);
-        span.record(
-            "skipped_in_progress",
-            reasons
-                .get(&UnevictableReason::InProgress)
-                .copied()
-                .unwrap_or(0),
-        );
-        span.record(
-            "skipped_restoring",
-            reasons
-                .get(&UnevictableReason::Restoring)
-                .copied()
-                .unwrap_or(0),
-        );
-        span.record(
-            "skipped_modified",
-            reasons
-                .get(&UnevictableReason::Modified)
-                .copied()
-                .unwrap_or(0),
-        );
-        span.record(
-            "skipped_transient_or_stateful",
-            reasons
-                .get(&UnevictableReason::TransientOrStateful)
-                .copied()
-                .unwrap_or(0),
-        );
-        span.record(
-            "skipped_nothing_to_evict",
-            reasons
-                .get(&UnevictableReason::NothingToEvict)
-                .copied()
-                .unwrap_or(0),
-        );
+        for reason in UnevictableReason::ALL {
+            span.record(reason.span_name(), reasons[reason.index()]);
+        }
 
         totals
     }

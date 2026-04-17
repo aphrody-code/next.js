@@ -318,9 +318,10 @@ async fn deep_chain(input: ResolvedVc<Step>) -> Result<Vc<Output>> {
 // evicted mid-session.
 // =========================================================================
 
-/// A value marked `session_stateful` — tasks that write cells of this type
-/// must not be evicted, because deserialization would lose the interior state.
-#[turbo_tasks::value(session_stateful)]
+/// A value marked `serialization = "none"` — tasks that write cells of this type cannot be
+/// persisted, so their data lives in `transient_cell_data` and is protected from eviction by
+/// the existing transient-cell check in the storage schema.
+#[turbo_tasks::value(serialization = "none", cell = "new", eq = "manual")]
 struct SessionCounter {
     count: u32,
 }
