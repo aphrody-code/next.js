@@ -432,7 +432,6 @@ impl Storage {
             skipped = tracing::field::Empty,
             skipped_in_progress = tracing::field::Empty,
             skipped_modified = tracing::field::Empty,
-            skipped_transient_or_stateful = tracing::field::Empty,
             skipped_nothing_to_evict = tracing::field::Empty,
         )
         .entered();

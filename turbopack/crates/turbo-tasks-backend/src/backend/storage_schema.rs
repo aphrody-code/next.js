@@ -445,9 +445,6 @@ pub enum UnevictableReason {
     InProgress,
     /// Modified flags are set, or data/meta has not been restored yet.
     Modified,
-    /// Transient references or transient cell data are present (detected without
-    /// re-running the expensive per-field checks).
-    Transient,
     // Keep `NothingToEvict` last: `COUNT` is derived from its discriminant.
     NothingToEvict,
 }
@@ -458,7 +455,6 @@ impl UnevictableReason {
     pub const ALL: [UnevictableReason; Self::COUNT] = [
         UnevictableReason::InProgress,
         UnevictableReason::Modified,
-        UnevictableReason::Transient,
         UnevictableReason::NothingToEvict,
     ];
 
@@ -477,7 +473,6 @@ impl UnevictableReason {
         match self {
             UnevictableReason::InProgress => "skipped_in_progress",
             UnevictableReason::Modified => "skipped_modified",
-            UnevictableReason::Transient => "skipped_transient",
             UnevictableReason::NothingToEvict => "skipped_nothing_to_evict",
         }
     }
@@ -572,61 +567,28 @@ impl TaskStorage {
         }
 
         // === Data evictability (independent) ===
-        // Data can be dropped if it's been restored from disk, hasn't been modified,
-        // and doesn't contain transient references that would be lost on restore.
+        // Data can be dropped if it's been restored from disk and hasn't been
+        // modified.
         let data_evictable = flags.data_restored()
             && !flags.data_modified()
-            && !flags.data_modified_during_snapshot()
-            && self.transient_cell_data().is_none_or(|m| m.is_empty())
-            // If transient tasks depend on our cells or output we cannot be evicted
-
-            // TODO: this is the most expensive part of the scan since there can be many cell and output dependents as well as many cells
-            && self
-                .cell_dependents()
-                .is_none_or(|cd| !cd.iter().any(|(_, _, t)| t.is_transient()))
-            && !self.output_dependent().iter().any(|d|d.is_transient());
+            && !flags.data_modified_during_snapshot();
 
         // === Meta evictability (independent) ===
-        // Meta can be dropped if it's been restored from disk, hasn't been modified,
-        // and doesn't contain transient references that would be lost on restore.
-        // Note: output is meta-category, so transient output blocks meta eviction.
-        // SessionDependent dirty does NOT block meta eviction because
-        // current_session_clean (transient) is preserved; on meta restore the dirty
-        // state comes back from disk correctly.
+        // Same semantics as data: flag checks only.
         let meta_evictable = flags.meta_restored()
             && !flags.meta_modified()
-            && !flags.meta_modified_during_snapshot()
-            && self.get_output().is_none_or(|o| !o.is_transient())
-            // TODO: this is the most expensive part of the scan since there can be many dependents and uppers
-            && self
-                .collectibles_dependents()
-                .is_none_or(|d| !d.iter().any(|(_trait_id, task)| task.is_transient()))
-            && !self.upper().iter().any(|(k, _)| k.is_transient());
+            && !flags.meta_modified_during_snapshot();
 
         // === Combined decision ===
         (
             key_evictability,
-            match (data_evictable, meta_evictable) {
-                (false, false) => {
-                    // Cheap flags checked first; if those are clear the blocker must
-                    // be one of the expensive transient/stateful checks above.
-                    let reason = if flags.data_modified()
-                        || flags.data_modified_during_snapshot()
-                        || flags.meta_modified()
-                        || flags.meta_modified_during_snapshot()
-                    {
-                        UnevictableReason::Modified
-                    } else {
-                        // Transient references or transient cell data are blocking —
-                        // don't repeat the expensive checks.
-                        UnevictableReason::Transient
-                    };
-                    ValueEvictability::Unevictable(reason)
-                }
-                _ => ValueEvictability::Evictable {
+            if !data_evictable && !meta_evictable {
+                ValueEvictability::Unevictable(UnevictableReason::Modified)
+            } else {
+                ValueEvictability::Evictable {
                     meta: meta_evictable,
                     data: data_evictable,
-                },
+                }
             },
         )
     }
@@ -1285,6 +1247,157 @@ mod tests {
         assert!(decoded.output_dependent().is_empty());
         assert_eq!(decoded.children(), None);
         assert_eq!(decoded.output_dependencies(), None);
+    }
+
+    // ==========================================================================
+    // drop_partial + restore_*_from round-trip with transient residue
+    // ==========================================================================
+
+    fn persistent_task(id: u32) -> TaskId {
+        assert!(id & turbo_tasks::TRANSIENT_TASK_BIT == 0);
+        TaskId::new(id).unwrap()
+    }
+
+    fn transient_task(id: u32) -> TaskId {
+        TaskId::new(id | turbo_tasks::TRANSIENT_TASK_BIT).unwrap()
+    }
+
+    /// After `drop_partial(data=true)`, persistent entries in `filter_transient`
+    /// data fields are cleared but transient residue must remain so transient
+    /// dependents aren't silently lost. `restore_data_from` must then merge the
+    /// persistent portion back in without clobbering the residue.
+    #[test]
+    fn drop_partial_retains_transient_residue_data() {
+        let mut storage = TaskStorage::new();
+
+        // Mix persistent and transient references in a filter_transient data field.
+        storage.output_dependent_mut().insert(persistent_task(1));
+        storage.output_dependent_mut().insert(persistent_task(2));
+        storage.output_dependent_mut().insert(transient_task(3));
+
+        // Lazy filter_transient data field.
+        storage.cell_dependencies_mut().insert((
+            CellRef {
+                task: persistent_task(10),
+                cell: CellId {
+                    type_id: unsafe { turbo_tasks::ValueTypeId::new_unchecked(1) },
+                    index: 0,
+                },
+            },
+            None,
+        ));
+
+        // Mark as restored so the task is eligible for dropping.
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+
+        storage.drop_partial(true, false);
+
+        // Persistent entries gone; transient residue preserved.
+        assert!(!storage.output_dependent().contains(&persistent_task(1)));
+        assert!(!storage.output_dependent().contains(&persistent_task(2)));
+        assert!(storage.output_dependent().contains(&transient_task(3)));
+        assert_eq!(storage.output_dependent().len(), 1);
+        // Lazy non-filter-transient residue: cell_dependencies had only persistent
+        // entries and should be dropped entirely.
+        assert!(storage.cell_dependencies().is_none());
+        // data_restored cleared; meta_restored untouched.
+        assert!(!storage.flags.data_restored());
+        assert!(storage.flags.meta_restored());
+
+        // Simulate a restore from disk: source has the persistent entries only
+        // (transient ones would have been filtered during encode).
+        let mut source = TaskStorage::new();
+        source.output_dependent_mut().insert(persistent_task(1));
+        source.output_dependent_mut().insert(persistent_task(2));
+
+        storage.restore_data_from(source);
+
+        // After restore: persistent + transient should both be present.
+        assert!(storage.output_dependent().contains(&persistent_task(1)));
+        assert!(storage.output_dependent().contains(&persistent_task(2)));
+        assert!(storage.output_dependent().contains(&transient_task(3)));
+        assert_eq!(storage.output_dependent().len(), 3);
+    }
+
+    /// Same idea for meta: transient `upper` keys (a `CounterMap` residue) must
+    /// survive the drop and merge cleanly with the persistent upper set on
+    /// restore.
+    #[test]
+    fn drop_partial_retains_transient_residue_meta() {
+        let mut storage = TaskStorage::new();
+
+        storage.upper_mut().insert(persistent_task(1), 1);
+        storage.upper_mut().insert(transient_task(2), 1);
+
+        // Also populate a lazy filter_transient meta field.
+        storage.children_mut().insert(persistent_task(100));
+        storage.children_mut().insert(transient_task(200));
+
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+
+        storage.drop_partial(false, true);
+
+        // Inline upper: transient residue remains.
+        assert_eq!(storage.upper().len(), 1);
+        assert_eq!(storage.upper().get(&transient_task(2)), Some(&1));
+        // Lazy children: transient residue remains.
+        assert_eq!(storage.children().unwrap().len(), 1);
+        assert!(storage.children().unwrap().contains(&transient_task(200)));
+        assert!(!storage.flags.meta_restored());
+        assert!(storage.flags.data_restored());
+
+        // Restore persistent meta fields.
+        let mut source = TaskStorage::new();
+        source.upper_mut().insert(persistent_task(1), 1);
+        source.children_mut().insert(persistent_task(100));
+
+        storage.restore_meta_from(source);
+
+        // After restore: residue + persistent are both present.
+        assert_eq!(storage.upper().len(), 2);
+        assert_eq!(storage.upper().get(&persistent_task(1)), Some(&1));
+        assert_eq!(storage.upper().get(&transient_task(2)), Some(&1));
+        assert_eq!(storage.children().unwrap().len(), 2);
+        assert!(storage.children().unwrap().contains(&persistent_task(100)));
+        assert!(storage.children().unwrap().contains(&transient_task(200)));
+    }
+
+    /// `drop_partial` on a field with no transient entries must fully reset the
+    /// field to default — this is the hot path we optimized for.
+    #[test]
+    fn drop_partial_resets_fields_without_transients() {
+        let mut storage = TaskStorage::new();
+
+        storage.output_dependent_mut().insert(persistent_task(1));
+        storage.output_dependent_mut().insert(persistent_task(2));
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+
+        storage.drop_partial(true, false);
+
+        assert!(storage.output_dependent().is_empty());
+    }
+
+    /// Filter-transient `output`: when `output` is `Some(transient)` it must
+    /// survive `drop_partial(meta=true)` so restore can merge the disk value
+    /// back in (normally disk value would be `None` if current output was
+    /// transient at encode time).
+    #[test]
+    fn drop_partial_retains_transient_output() {
+        let mut storage = TaskStorage::new();
+        storage.set_output(OutputValue::Output(transient_task(1)));
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+
+        storage.drop_partial(false, true);
+
+        // Transient output retained.
+        assert_eq!(
+            storage.get_output(),
+            Some(&OutputValue::Output(transient_task(1)))
+        );
     }
 
     // ==========================================================================
