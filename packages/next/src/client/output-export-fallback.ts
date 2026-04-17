@@ -7,18 +7,23 @@ import { RSC_CONTENT_TYPE_HEADER } from './components/app-router-headers'
 import { getRouteMatcher } from '../shared/lib/router/utils/route-matcher'
 import { getRouteRegex } from '../shared/lib/router/utils/route-regex'
 
-export function getOutputExportFallbackCandidates(pathname: string): string[] {
+function getOutputExportCandidatePrefixes(pathname: string): string[] {
   const segments = pathname.split('/').filter(Boolean)
   const candidates: string[] = []
 
-  for (let i = 1; i <= segments.length; i++) {
-    const prefix = segments.slice(0, i).join('/')
-    candidates.push(getOutputExportFallbackPath(prefix))
+  for (let i = segments.length; i >= 1; i--) {
+    candidates.push(segments.slice(0, i).join('/'))
   }
 
-  candidates.push(getOutputExportFallbackPath(''))
+  candidates.push('')
 
   return candidates
+}
+
+export function getOutputExportFallbackCandidates(pathname: string): string[] {
+  return getOutputExportCandidatePrefixes(pathname).map((prefix) =>
+    getOutputExportFallbackPath(prefix)
+  )
 }
 
 export function addOutputExportDataSuffix(url: URL): URL {

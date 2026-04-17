@@ -14,12 +14,12 @@ describe('output export fallback helpers', () => {
     jest.restoreAllMocks()
   })
 
-  it('discovers fallback candidates from shallowest static prefix to root', () => {
+  it('discovers fallback candidates from deepest static prefix to root', () => {
     expect(getOutputExportFallbackCandidates('/org/acme/chat/123')).toEqual([
-      '/org/__fallback',
-      '/org/acme/__fallback',
-      '/org/acme/chat/__fallback',
       '/org/acme/chat/123/__fallback',
+      '/org/acme/chat/__fallback',
+      '/org/acme/__fallback',
+      '/org/__fallback',
       '/__fallback',
     ])
   })
@@ -87,21 +87,28 @@ describe('output export fallback helpers', () => {
     ])
   })
 
-  it('walks prefixes from the root until a fallback payload is found', async () => {
+  it('falls through deeper prefixes before using a shallower fallback artifact', async () => {
     const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
 
-      if (url.endsWith('/org/__fallback.txt')) {
-        return new Response('payload', {
-          status: 200,
-          headers: { 'content-type': 'text/plain' },
-        })
-      }
-
-      if (url.endsWith('/org/__fallback/index.txt')) {
+      if (url.endsWith('/docs/guides/export/__fallback.meta.json')) {
         return new Response('not found', {
           status: 404,
           headers: { 'content-type': 'text/html' },
+        })
+      }
+
+      if (url.endsWith('/docs/guides/export/__fallback.txt')) {
+        return new Response('not found', {
+          status: 404,
+          headers: { 'content-type': 'text/html' },
+        })
+      }
+
+      if (url.endsWith('/docs/guides/__fallback.txt')) {
+        return new Response('payload', {
+          status: 200,
+          headers: { 'content-type': 'text/plain' },
         })
       }
 
@@ -113,14 +120,17 @@ describe('output export fallback helpers', () => {
 
     global.fetch = fetchMock as typeof fetch
 
-    const renderedUrl = new URL('https://example.com/org/acme/chat/123')
+    const renderedUrl = new URL('https://example.com/docs/guides/export')
     const result = await fetchOutputExportFallbackResponse(renderedUrl)
 
     expect(result).not.toBeNull()
     expect(result?.renderedUrl.href).toBe(renderedUrl.href)
+    expect(result?.fallbackUrl.pathname).toBe('/docs/guides/__fallback')
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
-      'https://example.com/org/__fallback.meta.json',
-      'https://example.com/org/__fallback.txt',
+      'https://example.com/docs/guides/export/__fallback.meta.json',
+      'https://example.com/docs/guides/export/__fallback.txt',
+      'https://example.com/docs/guides/__fallback.meta.json',
+      'https://example.com/docs/guides/__fallback.txt',
     ])
   })
 
@@ -170,9 +180,15 @@ describe('output export fallback helpers', () => {
 
     expect(result).not.toBeNull()
     expect(result?.fallbackUrl.pathname).toBe('/docs/__fallback/__route_0')
-    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
-      'https://example.com/docs/__fallback.meta.json',
-      'https://example.com/docs/__fallback/__route_0.txt',
-    ])
+    const requestedUrls = fetchMock.mock.calls.map(([url]) => String(url))
+    expect(requestedUrls).toContain(
+      'https://example.com/docs/__fallback.meta.json'
+    )
+    expect(requestedUrls).toContain(
+      'https://example.com/docs/__fallback/__route_0.txt'
+    )
+    expect(requestedUrls).not.toContain(
+      'https://example.com/docs/__fallback/__route_1.txt'
+    )
   })
 })
