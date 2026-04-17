@@ -2183,7 +2183,13 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         // If the task is stale, reschedule it
         #[cfg(not(feature = "no_fast_stale"))]
         if stale && !is_once_task {
-            let stale_priority = task.is_dirty().unwrap_or(TaskPriority::leaf());
+            let stale_priority = TaskPriority::invalidation(
+                task.get_leaf_distance()
+                    .copied()
+                    .unwrap_or_default()
+                    .distance,
+            )
+            .in_parent(task.is_dirty().unwrap_or(TaskPriority::leaf()));
             let Some(InProgressState::InProgress(box InProgressStateInner {
                 done_event,
                 mut new_children,
@@ -2561,7 +2567,13 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         // If the task is stale, reschedule it
         #[cfg(not(feature = "no_fast_stale"))]
         if *stale && !is_once_task {
-            let stale_priority = task.is_dirty().unwrap_or(TaskPriority::leaf());
+            let stale_priority = TaskPriority::invalidation(
+                task.get_leaf_distance()
+                    .copied()
+                    .unwrap_or_default()
+                    .distance,
+            )
+            .in_parent(task.is_dirty().unwrap_or(TaskPriority::leaf()));
             let Some(InProgressState::InProgress(box InProgressStateInner { done_event, .. })) =
                 task.take_in_progress()
             else {
@@ -2638,7 +2650,13 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
 
         // If the task is stale, reschedule it
         if stale && !is_once_task {
-            let stale_priority = task.is_dirty().unwrap_or(TaskPriority::leaf());
+            let stale_priority = TaskPriority::invalidation(
+                task.get_leaf_distance()
+                    .copied()
+                    .unwrap_or_default()
+                    .distance,
+            )
+            .in_parent(task.is_dirty().unwrap_or(TaskPriority::leaf()));
             let old = task.set_in_progress(InProgressState::Scheduled {
                 done_event,
                 reason: TaskExecutionReason::Stale,
