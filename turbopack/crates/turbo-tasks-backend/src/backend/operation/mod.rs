@@ -641,7 +641,7 @@ fn apply_restore_result(
                 task.flags.set_restoring(task_category, false);
                 return Ok(());
             }
-            task.restore_from(storage, task_category);
+            task.restore_from(storage, category);
             task.flags.set_restored(task_category);
             task.flags.set_restoring(task_category, false);
             Ok(())

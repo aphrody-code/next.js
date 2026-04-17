@@ -3532,15 +3532,6 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
         quote! {}
     };
 
-    let restore_all_flags = if has_any_flags {
-        quote! {
-            // Restore all persisted flags (preserve transient flags)
-            self.flags.set_persisted_bits(source.flags.persisted_bits());
-        }
-    } else {
-        quote! {}
-    };
-
     quote! {
         #[automatically_derived]
         impl TaskStorage {
@@ -3588,16 +3579,14 @@ fn generate_snapshot_restore_methods(grouped_fields: &GroupedFields) -> TokenStr
             /// The `category` parameter specifies which category of data to restore:
             /// - `Meta`: Restore meta fields (aggregation_number, output, upper, dirty, etc.)
             /// - `Data`: Restore data fields (output_dependent, dependencies, cell_data, etc.)
-            /// - `All`: Restore both meta and data fields
             pub fn restore_from(
                 &mut self,
                 source: TaskStorage,
-                category: crate::backend::TaskDataCategory,
+                category: crate::backend::SpecificTaskDataCategory,
             ) {
                 match category {
-                    crate::backend::TaskDataCategory::Meta => self.restore_meta_from(source),
-                    crate::backend::TaskDataCategory::Data => self.restore_data_from(source),
-                    crate::backend::TaskDataCategory::All => self.restore_all_from(source),
+                    crate::backend::SpecificTaskDataCategory::Meta => self.restore_meta_from(source),
+                    crate::backend::SpecificTaskDataCategory::Data => self.restore_data_from(source),
                 }
             }
 
