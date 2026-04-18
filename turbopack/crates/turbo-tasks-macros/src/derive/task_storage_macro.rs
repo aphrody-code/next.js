@@ -983,6 +983,22 @@ fn generate_task_flags_bitfield(grouped_fields: &GroupedFields) -> TokenStream {
                 self.0 = (self.0 & !Self::PERSISTED_MASK) | (bits & Self::PERSISTED_MASK);
             }
 
+            #[doc = "Clear all persisted meta flag bits, preserving transient flags."]
+            #[doc = ""]
+            #[doc = "Called by `drop_partial` when evicting the meta category so the"]
+            #[doc = "bitfield reflects \"no persisted meta state present\" — required"]
+            #[doc = "for `is_empty()` to accept fully-evicted tasks for removal."]
+            pub fn clear_persisted_meta_bits(&mut self) {
+                self.0 &= !Self::META_MASK;
+            }
+
+            #[doc = "Clear all persisted data flag bits, preserving transient flags."]
+            #[doc = ""]
+            #[doc = "Counterpart of `clear_persisted_meta_bits` for the data category."]
+            pub fn clear_persisted_data_bits(&mut self) {
+                self.0 &= !Self::DATA_MASK;
+            }
+
             #[doc = "Create from raw bits (for deserialization)"]
             pub fn from_bits(bits: u16) -> Self {
                 Self(bits)
@@ -2813,10 +2829,15 @@ fn generate_drop_method(grouped_fields: &GroupedFields) -> TokenStream {
                 debug_assert!(data || meta, "at least one of data and meta must be true");
                 if data {
                     #(#drop_data_inline)*
+                    // Clear persisted data flag bits so they don't keep an
+                    // otherwise-evicted task looking non-empty. They come back
+                    // via `set_persisted_data_bits` on restore.
+                    self.flags.clear_persisted_data_bits();
                     self.flags.set_data_restored(false);
                 }
                 if meta {
                     #(#drop_meta_inline)*
+                    self.flags.clear_persisted_meta_bits();
                     self.flags.set_meta_restored(false);
                 }
                 self.flags.set_prefetched(false);
@@ -2826,7 +2847,13 @@ fn generate_drop_method(grouped_fields: &GroupedFields) -> TokenStream {
                 // it becomes empty.
                 self.lazy.retain_mut(|f| {
                     if !f.is_persistent() {
-                        return true;
+                        // Transient variants normally stay put, but drop
+                        // empty ones. They accumulate as zombies when cells
+                        // get consumed without the task re-running (so
+                        // `shrink_on_completion` never fires), and the empty
+                        // `LazyField` variant blocks `is_empty()` from
+                        // accepting the task for full eviction.
+                        return !f.is_empty();
                     }
                     let drop_this = if f.is_data() { data } else { meta };
                     if !drop_this {

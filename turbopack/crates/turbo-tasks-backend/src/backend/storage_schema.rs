@@ -596,6 +596,99 @@ impl TaskStorage {
             },
         )
     }
+
+    /// Classify a task that has already been fully evicted (both `data_restored`
+    /// and `meta_restored` cleared) but is still present in the shard. Used for
+    /// metrics — tells us *why* `is_empty()` returned false so the eviction
+    /// pass couldn't erase it.
+    ///
+    /// Cheap checks first so the common case (`current_session_clean` shell)
+    /// returns quickly. Ordered so each arm excludes the state of the ones
+    /// above — the classifier returns the highest-priority category it finds.
+    fn classify_nothing_to_evict(&self) -> UnevictableReason {
+        let flags = &self.flags;
+
+        // True shell: nothing holding it alive. Should have been erased.
+        if self.is_empty() {
+            return UnevictableReason::NothingToEvictEmpty;
+        }
+
+        // `prefetched` shouldn't be set after eviction — drop_partial clears it
+        // and there's no path that should set it without a restore.
+        if flags.prefetched() {
+            return UnevictableReason::NothingToEvictPrefetched;
+        }
+
+        // `leaf_distance` is data-category and reset by drop_partial. Non-default
+        // here means someone set it without triggering a restore — investigate.
+        if self.leaf_distance != LeafDistance::default() {
+            return UnevictableReason::NothingToEvictLeafDistance;
+        }
+
+        // filter_transient inline residue: output_dependent / output / upper
+        // hold transient-keyed entries that survived drop_partial. These are
+        // real transient refs we're preserving.
+        if !self.output_dependent.is_empty() || self.output.is_some() || !self.upper.is_empty() {
+            return UnevictableReason::NothingToEvictInlineResidue;
+        }
+
+        // `aggregation_number` is meta + inline + default. drop_partial(meta)
+        // resets it. Non-default here would mirror the leaf_distance concern.
+        if self.aggregation_number != AggregationNumber::default() {
+            return UnevictableReason::NothingToEvictOther;
+        }
+
+        // Transient lazy variant present with actual contents. Break down by
+        // specific variant so we can see which transient field is the dominant
+        // blocker. Skip empty variants — an empty `TransientCellData(AutoMap)`
+        // shouldn't be counted as blocking (it's a zombie variant that
+        // `shrink_on_completion` would remove on next completion).
+        for f in &self.lazy {
+            if f.is_persistent() || f.is_empty() {
+                continue;
+            }
+            return match f {
+                LazyField::AggregatedCurrentSessionCleanContainers(_) => {
+                    UnevictableReason::NothingToEvictAggregatedSessionClean
+                }
+                LazyField::OutdatedCollectibles(_)
+                | LazyField::OutdatedOutputDependencies(_)
+                | LazyField::OutdatedCellDependencies(_)
+                | LazyField::OutdatedCollectiblesDependencies(_) => {
+                    UnevictableReason::NothingToEvictOutdated
+                }
+                LazyField::TransientCellData(_) => {
+                    UnevictableReason::NothingToEvictTransientCellData
+                }
+                LazyField::InProgressCells(_) => UnevictableReason::NothingToEvictInProgressCells,
+                _ => UnevictableReason::NothingToEvictTransientOther,
+            };
+        }
+
+        // Only `current_session_clean` (or nothing else we recognize) blocks
+        // reclamation. The benign expected case: keeps the "skip re-read on
+        // restore" optimization.
+        if flags.current_session_clean()
+            // Mask: was anything else in flags.0 set?
+            && flags.0 & !(1u16 << Self::current_session_clean_bit()) == 0
+        {
+            return UnevictableReason::NothingToEvictSessionCleanOnly;
+        }
+
+        UnevictableReason::NothingToEvictOther
+    }
+
+    /// Bit position of `current_session_clean` in `flags.0`. Keep this in sync
+    /// with the schema ordering (the macro puts persisted flags first, then
+    /// transient — `current_session_clean` is the first transient flag).
+    #[inline]
+    const fn current_session_clean_bit() -> u16 {
+        // TaskFlags bit layout: [meta flags: 0..M] [data flags: M..M+D] [transient: M+D..]
+        // Persisted meta: 0. Persisted data: 2 (invalidator, immutable). Total
+        // persisted: 2. First transient flag: current_session_clean at bit 2.
+        // If schema changes, test_schema_size / existing tests should catch.
+        (TaskFlags::DATA_MASK.count_ones() + TaskFlags::META_MASK.count_ones()) as u16
+    }
 }
 
 // =============================================================================
@@ -1382,6 +1475,31 @@ mod tests {
         storage.drop_partial(true, false);
 
         assert!(storage.output_dependent().is_empty());
+    }
+
+    /// Regression: `drop_partial(true, true)` must clear persisted flag bits
+    /// so a fully-evicted task reports `is_empty()`. Before this, tasks with
+    /// persistent data flags (e.g. `invalidator`, `immutable`) would get stuck
+    /// as `NothingToEvict` because `self.flags.0 != 0` even though all data
+    /// had been dropped.
+    #[test]
+    fn drop_partial_clears_persisted_flags_so_is_empty() {
+        let mut storage = TaskStorage::new();
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+        storage.flags.set_invalidator(true);
+        storage.flags.set_immutable(true);
+
+        storage.drop_partial(true, true);
+
+        assert!(!storage.flags.invalidator());
+        assert!(!storage.flags.immutable());
+        assert!(!storage.flags.data_restored());
+        assert!(!storage.flags.meta_restored());
+        assert!(
+            storage.is_empty(),
+            "fully evicted storage should be is_empty() so it can be removed from the shard"
+        );
     }
 
     /// Filter-transient `output`: when `output` is `Some(transient)` it must
