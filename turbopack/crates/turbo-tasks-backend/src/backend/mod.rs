@@ -2921,11 +2921,23 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                                     if check_idle_ended!() {
                                         // need to start all the way over so we catch the next
                                         // signal
+                                        eprintln!("SKIPPING EVICTION BECAUSE IDLE ENDED");
                                         continue 'outer;
                                     }
+                                    this.storage.evict_after_snapshot(background_span.id());
                                     evicted = true;
                                     ran_eviction = true;
-                                    this.storage.evict_after_snapshot(background_span.id());
+                                } else {
+                                    eprintln!(
+                                        "SKIPPING EVICTION BECAUSE {}",
+                                        if !this.should_evict() {
+                                            "ITS DISABLED"
+                                        } else if new_data {
+                                            "WTAF"
+                                        } else {
+                                            "NO NEW DATA"
+                                        }
+                                    );
                                 }
 
                                 // Compact while idle (up to limit), regardless of

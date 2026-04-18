@@ -18,11 +18,31 @@ describe('app-dir watch-distdir-deletion', () => {
     const warmupRes = await next.fetch('/')
     expect(warmupRes.status).toBe(200)
 
-    // Delete .next (which also removes .next/dev, the watched distDir)
-    await fs.promises.rm(path.join(next.testDir, '.next'), {
-      recursive: true,
-      force: true,
-    })
+    // Delete .next (which also removes .next/dev, the watched distDir).
+    // If rm races with the dev server writing new files into .next, we can hit
+    // ENOTEMPTY. On failure, list what remains so we can diagnose which files
+    // the server is still writing.
+    const distDir = path.join(next.testDir, '.next')
+    try {
+      await fs.promises.rm(distDir, { recursive: true, force: true })
+    } catch (err) {
+      let remaining: string[] = []
+      try {
+        const walk = async (dir: string) => {
+          for (const entry of await fs.promises.readdir(dir, {
+            withFileTypes: true,
+          })) {
+            const full = path.join(dir, entry.name)
+            remaining.push(full)
+            if (entry.isDirectory()) await walk(full)
+          }
+        }
+        await walk(distDir)
+      } catch {}
+      const e = err as Error
+      e.message += `\nRemaining entries under ${distDir} (${remaining.length}):\n${remaining.join('\n')}`
+      throw e
+    }
 
     // Wait for restart message and server to come back up
     await retry(
