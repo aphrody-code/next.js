@@ -29,9 +29,10 @@ import { createInitialRSCPayloadFromFallbackPrerender } from './flight-data-help
 import { getDeploymentId } from '../shared/lib/deployment-id'
 import { setNavigationBuildId } from './navigation-build-id'
 import {
-  addOutputExportDataSuffix,
+  getConfiguredOutputExportNotFoundCandidate,
   fetchOutputExportFallbackResponse,
   fetchOutputExportNotFoundDataResponse,
+  fetchOutputExportNotFoundResponse,
 } from './output-export-fallback'
 
 /// <reference types="react-dom/experimental" />
@@ -306,12 +307,11 @@ if (instantTestStaticFetch) {
       (await fetchOutputExportNotFoundDataResponse(renderedUrl, {
         credentials: 'same-origin',
       })) ??
-      (await fetch(
-        addOutputExportDataSuffix(new URL('/_not-found', renderedUrl)),
-        {
-          credentials: 'same-origin',
-        }
-      ))
+      (await fetchOutputExportNotFoundResponse(renderedUrl, {
+        credentials: 'same-origin',
+      }))
+    initialOutputExportFallbackBasePath =
+      getConfiguredOutputExportNotFoundCandidate(renderedUrl.pathname)
 
     // Let rewritten-path/query headers on the fetched fallback response win
     // over the current document URL when the host remaps the request.

@@ -250,6 +250,7 @@ if (skipped) {
       })
 
       it('prefers deeper static-prefix fallback routes over shallower overlaps', async () => {
+        clearRequests()
         const browser = await webdriver(port, '/docs/reference/export/')
 
         try {
@@ -259,6 +260,17 @@ if (skipped) {
             )
           })
 
+          const requests = getRequests()
+          expect(
+            requests.some((requestPath) =>
+              requestPath.startsWith('/docs/__fallback')
+            )
+          ).toBe(false)
+          expect(
+            requests.filter((requestPath) =>
+              requestPath.startsWith('/docs/reference/__fallback/index.txt')
+            )
+          ).toHaveLength(1)
           await browser.elementByCss('a[href="/docs/"]').click()
           await retry(async () => {
             expect(await browser.elementByCss('h1').text()).toBe('Docs')
