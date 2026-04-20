@@ -3,6 +3,8 @@ import {
   getOutputExportFallbackPath,
   type OutputExportFallbackManifestEntry,
 } from '../lib/output-export-dynamic-fallback'
+import { addPathPrefix } from '../shared/lib/router/utils/add-path-prefix'
+import { removePathPrefix } from '../shared/lib/router/utils/remove-path-prefix'
 import { RSC_CONTENT_TYPE_HEADER } from './components/app-router-headers'
 import { getRouteMatcher } from '../shared/lib/router/utils/route-matcher'
 import { getRouteRegex } from '../shared/lib/router/utils/route-regex'
@@ -56,8 +58,9 @@ function matchOutputExportFallbackManifestEntry(
   entry: OutputExportFallbackManifestEntry,
   pathname: string
 ): boolean {
+  const basePath = process.env.__NEXT_ROUTER_BASEPATH || ''
   const matcher = getRouteMatcher(getRouteRegex(entry.route))
-  return matcher(pathname) !== false
+  return matcher(removePathPrefix(pathname, basePath)) !== false
 }
 
 async function fetchOutputExportFallbackManifest(
@@ -143,7 +146,11 @@ export async function fetchOutputExportFallbackResponse(
         }
 
         const branchFallbackUrl = new URL(renderedUrl)
-        branchFallbackUrl.pathname = entry.fallbackPath
+        const basePath = process.env.__NEXT_ROUTER_BASEPATH || ''
+        branchFallbackUrl.pathname = addPathPrefix(
+          removePathPrefix(entry.fallbackPath, basePath),
+          basePath
+        )
 
         const response = await fetchOutputExportDataResponse(
           branchFallbackUrl,
