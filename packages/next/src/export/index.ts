@@ -1186,7 +1186,7 @@ async function exportAppImpl(
 
           await Promise.all(
             manifestEntries.map(({ fallbackPath, orig }) =>
-              emitFallbackArtifacts(fallbackPath, orig, false)
+              emitFallbackArtifacts(fallbackPath, orig, true)
             )
           )
         }
