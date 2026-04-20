@@ -52,34 +52,37 @@ struct NextFontLocalFontFileOptions {
 #[turbo_tasks::value]
 pub(crate) struct NextFontLocalResolvePlugin {
     root: FileSystemPath,
+    condition: ResolvedVc<BeforeResolvePluginCondition>,
 }
 
 #[turbo_tasks::value_impl]
 impl NextFontLocalResolvePlugin {
     #[turbo_tasks::function]
-    pub fn new(root: FileSystemPath) -> Vc<Self> {
-        NextFontLocalResolvePlugin { root }.cell()
-    }
-}
-
-#[turbo_tasks::value_impl]
-impl BeforeResolvePlugin for NextFontLocalResolvePlugin {
-    #[turbo_tasks::function]
-    fn before_resolve_condition(&self) -> Vc<BeforeResolvePluginCondition> {
-        BeforeResolvePluginCondition::from_request_glob(Glob::new(
+    pub async fn new(root: FileSystemPath) -> Result<Vc<Self>> {
+        let condition = BeforeResolvePluginCondition::from_request_glob(Glob::new(
             rcstr!("{next,@vercel/turbopack-next/internal}/font/local/*"),
             GlobOptions::default(),
         ))
+        .to_resolved()
+        .await?;
+        Ok(NextFontLocalResolvePlugin { root, condition }.cell())
+    }
+}
+
+#[async_trait]
+#[turbo_tasks::value_impl]
+impl BeforeResolvePlugin for NextFontLocalResolvePlugin {
+    fn before_resolve_condition(&self) -> Vc<BeforeResolvePluginCondition> {
+        *self.condition
     }
 
-    #[turbo_tasks::function]
     async fn before_resolve(
-        self: Vc<Self>,
+        &self,
         lookup_path: FileSystemPath,
         _reference_type: ReferenceType,
         request_vc: Vc<Request>,
     ) -> Result<Vc<ResolveResultOption>> {
-        let this = &*self.await?;
+        let this = self;
         let request = &*request_vc.await?;
 
         let Some(request_key) = request.request() else {

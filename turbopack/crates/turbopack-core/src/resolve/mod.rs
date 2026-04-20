@@ -84,7 +84,7 @@ pub enum ResolveErrorMode {
 /// Type alias for a resolved after-resolve plugin paired with its condition.
 type AfterResolvePluginWithCondition = (
     ResolvedVc<Box<dyn AfterResolvePlugin>>,
-    ResolvedVc<AfterResolvePluginCondition>,
+    ReadRef<AfterResolvePluginCondition>,
 );
 
 #[turbo_tasks::value(shared)]
@@ -1743,10 +1743,12 @@ async fn get_matching_before_resolve_plugins(
     options: Vc<ResolveOptions>,
     request: Vc<Request>,
 ) -> Result<Vc<MatchingBeforeResolvePlugins>> {
+    let request_ref = request.await?;
     let mut matching_plugins = Vec::new();
     for &plugin in &options.await?.before_resolve_plugins {
-        let condition = plugin.before_resolve_condition().to_resolved().await?;
-        if *condition.matches(request).await? {
+        let trait_ref = plugin.into_trait_ref().await?;
+        let condition = trait_ref.before_resolve_condition().await?;
+        if condition.matches(&request_ref) {
             matching_plugins.push(plugin);
         }
     }
@@ -1762,7 +1764,10 @@ async fn handle_before_resolve_plugins(
 ) -> Result<Option<Vc<ResolveResult>>> {
     for plugin in get_matching_before_resolve_plugins(options, request).await? {
         if let Some(result) = *plugin
+            .into_trait_ref()
+            .await?
             .before_resolve(lookup_path.clone(), reference_type.clone(), request)
+            .await?
             .await?
         {
             return Ok(Some(*result));
@@ -1786,7 +1791,11 @@ async fn handle_after_resolve_plugins(
     let resolved_conditions = options_value
         .after_resolve_plugins
         .iter()
-        .map(async |p| Ok((*p, p.after_resolve_condition().to_resolved().await?)))
+        .map(async |p| {
+            let trait_ref = p.into_trait_ref().await?;
+            let condition = trait_ref.after_resolve_condition().await?;
+            Ok((*p, condition))
+        })
         .try_join()
         .await?;
 
@@ -1798,14 +1807,17 @@ async fn handle_after_resolve_plugins(
         plugins_with_conditions: &[AfterResolvePluginWithCondition],
     ) -> Result<Option<Vc<ResolveResult>>> {
         for (plugin, after_resolve_condition) in plugins_with_conditions {
-            if *after_resolve_condition.matches(path.clone()).await?
+            if after_resolve_condition.matches(&path)
                 && let Some(result) = *plugin
+                    .into_trait_ref()
+                    .await?
                     .after_resolve(
                         path.clone(),
                         lookup_path.clone(),
                         reference_type.clone(),
                         request,
                     )
+                    .await?
                     .await?
             {
                 return Ok(Some(*result));

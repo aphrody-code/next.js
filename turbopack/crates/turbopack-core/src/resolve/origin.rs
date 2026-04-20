@@ -27,8 +27,7 @@ pub trait ResolveOrigin {
     /// Get an inner asset form this origin that doesn't require resolving but
     /// is directly attached
     #[turbo_tasks::function]
-    fn get_inner_asset(self: Vc<Self>, request: Vc<Request>) -> Vc<OptionModule> {
-        let _ = request;
+    fn get_inner_asset(self: Vc<Self>, _request: Vc<Request>) -> Vc<OptionModule> {
         Vc::cell(None)
     }
 
