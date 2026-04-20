@@ -337,8 +337,9 @@ if (instantTestStaticFetch) {
 
     return createInitialRSCPayloadFromFallbackPrerender(
       await processedResponse,
-      fallbackInitialRSCPayload,
-      renderedUrl
+      // Let rewritten-path/query headers on the fetched fallback response win
+      // over the current document URL when the host remaps the request.
+      fallbackInitialRSCPayload
     )
   })()
 } else if (
