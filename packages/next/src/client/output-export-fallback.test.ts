@@ -498,7 +498,7 @@ describe('output export fallback helpers', () => {
     process.env.__NEXT_ROUTER_BASEPATH = '/docs'
     process.env.__NEXT_TRAILING_SLASH = 'true'
 
-    const fetchMock = jest.fn(async () => {
+    const fetchMock = jest.fn(async (_input: RequestInfo | URL) => {
       return new Response('payload', {
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
