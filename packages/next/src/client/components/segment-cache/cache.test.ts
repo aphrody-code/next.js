@@ -2,9 +2,11 @@ import {
   HEAD_REQUEST_KEY,
   type SegmentRequestKey,
 } from '../../../shared/lib/segment-cache/segment-value-encoding'
+import type { VaryParamsThenable } from '../../../shared/lib/segment-cache/vary-params-decoding'
 import { FetchStrategy } from './types'
 import { Fallback } from './cache-map'
 import {
+  EntryStatus,
   getOutputExportSegmentRequestUrl,
   invalidateEntirePrefetchCache,
   readSegmentCacheEntry,
@@ -104,13 +106,13 @@ describe('readOrCreateSegmentCacheEntry output export fallback', () => {
     )
 
     expect(firstEntry).toBe(secondEntry)
-    expect(secondTree.varyPath.parent.parent.value).toBe('second')
-    expect(
-      (
-        secondTree.varyPath.parent
-          .parent as typeof secondTree.varyPath.parent.parent
-      ).value
-    ).not.toBe(Fallback)
+    const secondThreadVaryPath = secondTree.varyPath.parent?.parent
+    expect(secondThreadVaryPath).not.toBeNull()
+    if (secondThreadVaryPath === null) {
+      throw new Error('expected metadata vary path to include thread params')
+    }
+    expect(secondThreadVaryPath.value).toBe('second')
+    expect(secondThreadVaryPath.value).not.toBe(Fallback)
   })
 
   it('rekeys runtime-prefetched fallback segments under generic params', () => {
@@ -137,15 +139,38 @@ describe('readOrCreateSegmentCacheEntry output export fallback', () => {
 
     const firstTree = makeTree('first')
     const secondTree = makeTree('second')
+    const emptyEntry = readOrCreateSegmentCacheEntry(
+      now,
+      FetchStrategy.PPRRuntime,
+      firstTree,
+      '/t/__fallback'
+    )
+    expect(emptyEntry.status).toBe(EntryStatus.Empty)
+    if (emptyEntry.status !== EntryStatus.Empty) {
+      throw new Error('expected a new empty segment cache entry')
+    }
     const ownedEntry = upgradeToPendingSegment(
-      readOrCreateSegmentCacheEntry(
-        now,
-        FetchStrategy.PPRRuntime,
-        firstTree,
-        '/t/__fallback'
-      ),
+      emptyEntry,
       FetchStrategy.PPRRuntime
     )
+    const fulfilledVaryParams = new Set(['threadId'])
+    const fulfilledVaryParamsThenable: VaryParamsThenable = {
+      status: 'fulfilled',
+      value: fulfilledVaryParams,
+      then<TResult1 = Set<string>, TResult2 = never>(
+        onfulfilled?:
+          | ((value: Set<string>) => TResult1 | PromiseLike<TResult1>)
+          | null,
+        _onrejected?:
+          | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+          | null
+      ): PromiseLike<TResult1 | TResult2> {
+        if (onfulfilled) {
+          return Promise.resolve(onfulfilled(fulfilledVaryParams))
+        }
+        return Promise.resolve(fulfilledVaryParams as TResult1)
+      },
+    }
 
     writeDynamicRenderResponseIntoCache(
       now,
@@ -161,7 +186,7 @@ describe('readOrCreateSegmentCacheEntry output export fallback', () => {
             {},
             null,
             false,
-            Promise.resolve(new Set(['threadId'])),
+            fulfilledVaryParamsThenable,
           ],
           head: null,
           isHeadPartial: false,
@@ -187,6 +212,6 @@ describe('readOrCreateSegmentCacheEntry output export fallback', () => {
     const secondEntry = readSegmentCacheEntry(now, secondTree.varyPath)
 
     expect(secondEntry).toBe(ownedEntry)
-    expect(secondEntry?.status).toBe(2)
+    expect(secondEntry?.status).toBe(EntryStatus.Fulfilled)
   })
 })

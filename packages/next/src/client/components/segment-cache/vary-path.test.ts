@@ -1,11 +1,22 @@
 import { Fallback } from './cache-map'
 import { FetchStrategy } from './types'
 import {
+  HEAD_REQUEST_KEY,
+  type SegmentRequestKey,
+} from '../../../shared/lib/segment-cache/segment-value-encoding'
+import {
   finalizeMetadataVaryPath,
   finalizePageVaryPath,
   getFulfilledSegmentVaryPath,
   getSegmentVaryPathForRequest,
 } from './vary-path'
+
+function getRequiredParent<T extends { parent: unknown | null }>(
+  path: T
+): Exclude<T['parent'], null> {
+  expect(path.parent).not.toBeNull()
+  return path.parent as Exclude<T['parent'], null>
+}
 
 describe('getSegmentVaryPathForRequest output export fallback', () => {
   it('reuses path params for normal static prefetches', () => {
@@ -22,8 +33,8 @@ describe('getSegmentVaryPathForRequest output export fallback', () => {
     const requestVaryPath = getSegmentVaryPathForRequest(
       FetchStrategy.PPR,
       {
-        requestKey: '/_head',
-        segment: '/_head',
+        requestKey: HEAD_REQUEST_KEY,
+        segment: HEAD_REQUEST_KEY,
         refreshState: null,
         varyPath,
         isPage: true,
@@ -33,7 +44,9 @@ describe('getSegmentVaryPathForRequest output export fallback', () => {
       null
     )
 
-    expect(requestVaryPath.parent.parent.value).toBe('j97358')
+    expect(getRequiredParent(getRequiredParent(requestVaryPath)).value).toBe(
+      'j97358'
+    )
   })
 
   it('treats path params as reusable for learned output export fallback routes', () => {
@@ -50,8 +63,8 @@ describe('getSegmentVaryPathForRequest output export fallback', () => {
     const requestVaryPath = getSegmentVaryPathForRequest(
       FetchStrategy.PPR,
       {
-        requestKey: '/t/$d$threadId/__PAGE__',
-        segment: '/t/$d$threadId',
+        requestKey: '/t/$d$threadId/__PAGE__' as SegmentRequestKey,
+        segment: '/t/$d$threadId' as SegmentRequestKey,
         refreshState: null,
         varyPath,
         isPage: true,
@@ -61,8 +74,10 @@ describe('getSegmentVaryPathForRequest output export fallback', () => {
       '/t/__fallback'
     )
 
-    expect(requestVaryPath.parent.value).toBe(Fallback)
-    expect(requestVaryPath.parent.parent.value).toBe(Fallback)
+    expect(getRequiredParent(requestVaryPath).value).toBe(Fallback)
+    expect(getRequiredParent(getRequiredParent(requestVaryPath)).value).toBe(
+      Fallback
+    )
   })
 
   it('keeps fulfilled fallback segment path params generic even when vary params include them', () => {
@@ -82,7 +97,9 @@ describe('getSegmentVaryPathForRequest output export fallback', () => {
       true
     )
 
-    expect(fulfilledVaryPath.parent.value).toBe('')
-    expect(fulfilledVaryPath.parent.parent.value).toBe(Fallback)
+    expect(getRequiredParent(fulfilledVaryPath).value).toBe('')
+    expect(getRequiredParent(getRequiredParent(fulfilledVaryPath)).value).toBe(
+      Fallback
+    )
   })
 })

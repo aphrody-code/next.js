@@ -87,7 +87,9 @@ describe('createInitialRouterState output export fallback', () => {
     createInitialRouterState({
       navigatedAt: Date.now(),
       initialRSCPayload,
-      location: new URL('https://example.com/hydrated/first/') as Location,
+      location: new URL(
+        'https://example.com/hydrated/first/'
+      ) as unknown as Location,
       outputExportFallbackBasePath: '/hydrated/__fallback',
     })
 
@@ -122,7 +124,9 @@ describe('createInitialRouterState output export fallback', () => {
         ...initialRSCPayload,
         p: new ReadableStream<Uint8Array>(),
       },
-      location: new URL('https://example.com/hydrated/first/') as Location,
+      location: new URL(
+        'https://example.com/hydrated/first/'
+      ) as unknown as Location,
       outputExportFallbackBasePath: '/hydrated/__fallback',
     })
 
