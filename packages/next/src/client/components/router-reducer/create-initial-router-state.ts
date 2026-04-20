@@ -202,6 +202,8 @@ export function createInitialRouterState({
       )
         .then((processed) => {
           if (processed !== null) {
+            processed.navigationSeed.outputExportFallbackBasePath =
+              outputExportFallbackBasePath
             writeDynamicRenderResponseIntoCache(
               Date.now(),
               FetchStrategy.PPRRuntime,

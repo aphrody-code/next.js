@@ -2041,6 +2041,7 @@ async function fetchRouteOnCacheMissFromOutputExportFallback(
     renderedSearch,
     UnknownDynamicStaleTime
   )
+  navigationSeed.outputExportFallbackBasePath = outputExportFallbackBasePath
   if (navigationSeed.metadataVaryPath === null) {
     rejectRouteCacheEntry(entry, now + 10 * 1000)
     return null
@@ -2112,8 +2113,14 @@ async function fetchSegmentsFromOutputExportFallback(
     return null
   }
 
-  const { buildId, closed, flightDatas, headVaryParams, staleAt } =
-    navigationData
+  const {
+    buildId,
+    closed,
+    flightDatas,
+    headVaryParams,
+    outputExportFallbackBasePath,
+    staleAt,
+  } = navigationData
   const renderedSearch = renderedUrl.search as NormalizedSearch
 
   const spawnedEntries = new Map<SegmentRequestKey, PendingSegmentCacheEntry>()
@@ -2138,6 +2145,7 @@ async function fetchSegmentsFromOutputExportFallback(
     renderedSearch,
     UnknownDynamicStaleTime
   )
+  navigationSeed.outputExportFallbackBasePath = outputExportFallbackBasePath
   if (navigationSeed.metadataVaryPath === null) {
     rejectRemainingSegmentsInBundle(segments, now + 10 * 1000)
     return null
@@ -2783,6 +2791,7 @@ export function writeDynamicRenderResponseIntoCache(
         staleAt,
         seedData,
         isResponsePartial,
+        navigationSeed.outputExportFallbackBasePath,
         spawnedEntries
       )
     }
@@ -2812,6 +2821,7 @@ export function writeDynamicRenderResponseIntoCache(
         // parameter.
         headVaryParams,
         metadataTree,
+        navigationSeed.outputExportFallbackBasePath,
         spawnedEntries
       )
     }
@@ -2845,6 +2855,7 @@ function writeSeedDataIntoCache(
   staleAt: number,
   seedData: CacheNodeSeedData,
   isResponsePartial: boolean,
+  outputExportFallbackBasePath: string | null,
   entriesOwnedByCurrentTask: Map<
     SegmentRequestKey,
     PendingSegmentCacheEntry
@@ -2868,6 +2879,7 @@ function writeSeedDataIntoCache(
     staleAt,
     varyParams,
     tree,
+    outputExportFallbackBasePath,
     entriesOwnedByCurrentTask
   )
 
@@ -2887,6 +2899,7 @@ function writeSeedDataIntoCache(
           staleAt,
           childSeedData,
           isResponsePartial,
+          outputExportFallbackBasePath,
           entriesOwnedByCurrentTask
         )
       }
@@ -2906,6 +2919,7 @@ function fulfillEntrySpawnedByRuntimePrefetch(
   staleAt: number,
   segmentVaryParams: Set<string> | null,
   tree: RouteTree,
+  outputExportFallbackBasePath: string | null,
   entriesOwnedByCurrentTask: Map<
     SegmentRequestKey,
     PendingSegmentCacheEntry
@@ -2929,7 +2943,8 @@ function fulfillEntrySpawnedByRuntimePrefetch(
     if (process.env.__NEXT_VARY_PARAMS && segmentVaryParams !== null) {
       const fulfilledVaryPath = getFulfilledSegmentVaryPath(
         tree.varyPath,
-        segmentVaryParams
+        segmentVaryParams,
+        outputExportFallbackBasePath !== null
       )
       const isRevalidation = false
       setInCacheMap(
@@ -2959,7 +2974,8 @@ function fulfillEntrySpawnedByRuntimePrefetch(
       if (process.env.__NEXT_VARY_PARAMS && segmentVaryParams !== null) {
         const fulfilledVaryPath = getFulfilledSegmentVaryPath(
           tree.varyPath,
-          segmentVaryParams
+          segmentVaryParams,
+          outputExportFallbackBasePath !== null
         )
         const isRevalidation = false
         setInCacheMap(
@@ -2985,7 +3001,11 @@ function fulfillEntrySpawnedByRuntimePrefetch(
       // the request vary path.
       const varyPath =
         process.env.__NEXT_VARY_PARAMS && segmentVaryParams !== null
-          ? getFulfilledSegmentVaryPath(tree.varyPath, segmentVaryParams)
+          ? getFulfilledSegmentVaryPath(
+              tree.varyPath,
+              segmentVaryParams,
+              outputExportFallbackBasePath !== null
+            )
           : getSegmentVaryPathForRequest(fetchStrategy, tree)
       upsertSegmentEntry(now, varyPath, newEntry)
     }

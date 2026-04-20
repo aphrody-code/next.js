@@ -5,6 +5,8 @@ const mockGetFlightDataPartsFromPath = jest.fn()
 const mockCreateInitialCacheNodeForHydration = jest.fn()
 const mockConvertRootFlightRouterStateToRouteTree = jest.fn()
 const mockDiscoverKnownRoute = jest.fn()
+const mockProcessRuntimePrefetchStream = jest.fn()
+const mockWriteDynamicRenderResponseIntoCache = jest.fn()
 
 jest.mock('../../flight-data-helpers', () => ({
   getFlightDataPartsFromPath: (...args: Array<unknown>) =>
@@ -21,8 +23,10 @@ jest.mock('../segment-cache/cache', () => ({
     mockConvertRootFlightRouterStateToRouteTree(...args),
   getStaleTimeMs: jest.fn((staleTime: number) => staleTime),
   getStaleAt: jest.fn(),
-  processRuntimePrefetchStream: jest.fn(),
-  writeDynamicRenderResponseIntoCache: jest.fn(),
+  processRuntimePrefetchStream: (...args: Array<unknown>) =>
+    mockProcessRuntimePrefetchStream(...args),
+  writeDynamicRenderResponseIntoCache: (...args: Array<unknown>) =>
+    mockWriteDynamicRenderResponseIntoCache(...args),
   writeStaticStageResponseIntoCache: jest.fn(),
 }))
 
@@ -52,6 +56,8 @@ describe('createInitialRouterState output export fallback', () => {
     mockCreateInitialCacheNodeForHydration.mockReset()
     mockConvertRootFlightRouterStateToRouteTree.mockReset()
     mockDiscoverKnownRoute.mockReset()
+    mockProcessRuntimePrefetchStream.mockReset()
+    mockWriteDynamicRenderResponseIntoCache.mockReset()
 
     discoveredRouteEntry.outputExportFallbackBasePath = null
 
@@ -87,6 +93,57 @@ describe('createInitialRouterState output export fallback', () => {
 
     expect(discoveredRouteEntry.outputExportFallbackBasePath).toBe(
       '/hydrated/__fallback'
+    )
+  })
+
+  it('passes the learned fallback artifact base path into runtime-prefetch cache writes', async () => {
+    const processedNavigationSeed = {
+      renderedSearch: '',
+      routeTree: { path: '/hydrated/[thread]' },
+      metadataVaryPath: null,
+      data: null,
+      head: null,
+      dynamicStaleAt: Date.now() + 30_000,
+      outputExportFallbackBasePath: null as string | null,
+    }
+
+    mockProcessRuntimePrefetchStream.mockResolvedValue({
+      flightDatas: [],
+      navigationSeed: processedNavigationSeed,
+      buildId: undefined,
+      isResponsePartial: false,
+      headVaryParams: null,
+      staleAt: Date.now() + 30_000,
+    })
+
+    createInitialRouterState({
+      navigatedAt: Date.now(),
+      initialRSCPayload: {
+        ...initialRSCPayload,
+        p: new ReadableStream<Uint8Array>(),
+      },
+      location: new URL('https://example.com/hydrated/first/') as Location,
+      outputExportFallbackBasePath: '/hydrated/__fallback',
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(processedNavigationSeed.outputExportFallbackBasePath).toBe(
+      '/hydrated/__fallback'
+    )
+    expect(mockWriteDynamicRenderResponseIntoCache).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.anything(),
+      expect.any(Array),
+      undefined,
+      false,
+      null,
+      expect.any(Number),
+      expect.objectContaining({
+        outputExportFallbackBasePath: '/hydrated/__fallback',
+      }),
+      null
     )
   })
 })

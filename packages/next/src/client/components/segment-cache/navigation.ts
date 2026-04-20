@@ -317,6 +317,7 @@ function navigateUsingPrefetchedRouteTree(
     data: null,
     head: null,
     dynamicStaleAt: computeDynamicStaleAt(now, UnknownDynamicStaleTime),
+    outputExportFallbackBasePath: route.outputExportFallbackBasePath,
   }
   return navigateToKnownRoute(
     now,
@@ -427,6 +428,7 @@ async function navigateToUnknownRoute(
     renderedSearch,
     dynamicStaleTime
   )
+  navigationSeed.outputExportFallbackBasePath = outputExportFallbackBasePath
 
   // Learn the route pattern so we can predict it for future navigations.
   // hasDynamicRewrite is false because this is a fresh navigation to an
@@ -490,6 +492,8 @@ async function navigateToUnknownRoute(
       )
         .then((processed) => {
           if (processed !== null) {
+            processed.navigationSeed.outputExportFallbackBasePath =
+              outputExportFallbackBasePath
             writeDynamicRenderResponseIntoCache(
               now,
               FetchStrategy.PPRRuntime,
@@ -748,6 +752,7 @@ export type NavigationSeed = {
   data: CacheNodeSeedData | null
   head: HeadData | null
   dynamicStaleAt: number
+  outputExportFallbackBasePath: string | null
 }
 
 export function convertServerPatchToFullTree(
@@ -821,6 +826,7 @@ export function convertServerPatchToFullTree(
     renderedSearch,
     head,
     dynamicStaleAt: computeDynamicStaleAt(now, dynamicStaleTimeSeconds),
+    outputExportFallbackBasePath: null,
   }
 }
 

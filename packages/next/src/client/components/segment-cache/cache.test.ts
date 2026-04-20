@@ -6,9 +6,13 @@ import { FetchStrategy } from './types'
 import { Fallback } from './cache-map'
 import {
   getOutputExportSegmentRequestUrl,
+  invalidateEntirePrefetchCache,
+  readSegmentCacheEntry,
   readOrCreateSegmentCacheEntry,
+  upgradeToPendingSegment,
+  writeDynamicRenderResponseIntoCache,
 } from './cache'
-import { finalizeMetadataVaryPath } from './vary-path'
+import { finalizeMetadataVaryPath, finalizePageVaryPath } from './vary-path'
 
 describe('getOutputExportSegmentRequestUrl', () => {
   it('uses the concrete rendered route when no fallback base path is known', () => {
@@ -49,6 +53,11 @@ describe('getOutputExportSegmentRequestUrl', () => {
 })
 
 describe('readOrCreateSegmentCacheEntry output export fallback', () => {
+  afterEach(() => {
+    delete process.env.__NEXT_VARY_PARAMS
+    invalidateEntirePrefetchCache(null, ['', {}])
+  })
+
   it('dedupes pending metadata entries across sibling fallback params', () => {
     const now = Date.now()
     const firstTree = {
@@ -102,5 +111,82 @@ describe('readOrCreateSegmentCacheEntry output export fallback', () => {
           .parent as typeof secondTree.varyPath.parent.parent
       ).value
     ).not.toBe(Fallback)
+  })
+
+  it('rekeys runtime-prefetched fallback segments under generic params', () => {
+    process.env.__NEXT_VARY_PARAMS = 'true'
+
+    const now = Date.now()
+    const makeTree = (thread: string) => ({
+      requestKey: '/t/$d$threadId/__PAGE__' as SegmentRequestKey,
+      segment: '/t/$d$threadId' as SegmentRequestKey,
+      refreshState: null,
+      varyPath: finalizePageVaryPath(
+        '/t/$d$threadId/__PAGE__' as SegmentRequestKey,
+        '' as any,
+        {
+          id: 'threadId',
+          value: thread as any,
+          parent: null,
+        } as any
+      ),
+      isPage: true as const,
+      slots: null,
+      prefetchHints: 0,
+    })
+
+    const firstTree = makeTree('first')
+    const secondTree = makeTree('second')
+    const ownedEntry = upgradeToPendingSegment(
+      readOrCreateSegmentCacheEntry(
+        now,
+        FetchStrategy.PPRRuntime,
+        firstTree,
+        '/t/__fallback'
+      ),
+      FetchStrategy.PPRRuntime
+    )
+
+    writeDynamicRenderResponseIntoCache(
+      now,
+      FetchStrategy.PPRRuntime,
+      [
+        {
+          segmentPath: [],
+          pathToSegment: [],
+          segment: '',
+          tree: ['', {}],
+          seedData: [
+            'runtime fallback data',
+            {},
+            null,
+            false,
+            Promise.resolve(new Set(['threadId'])),
+          ],
+          head: null,
+          isHeadPartial: false,
+          isRootRender: true,
+        },
+      ],
+      undefined,
+      false,
+      null,
+      now + 30_000,
+      {
+        renderedSearch: '',
+        routeTree: firstTree,
+        metadataVaryPath: null,
+        data: null,
+        head: null,
+        dynamicStaleAt: now + 30_000,
+        outputExportFallbackBasePath: '/t/__fallback',
+      },
+      new Map([[firstTree.requestKey, ownedEntry]])
+    )
+
+    const secondEntry = readSegmentCacheEntry(now, secondTree.varyPath)
+
+    expect(secondEntry).toBe(ownedEntry)
+    expect(secondEntry?.status).toBe(2)
   })
 })
