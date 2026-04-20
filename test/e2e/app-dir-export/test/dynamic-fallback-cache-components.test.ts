@@ -271,6 +271,7 @@ if (skipped) {
               requestPath.startsWith('/docs/reference/__fallback/index.txt')
             )
           ).toHaveLength(1)
+
           await browser.elementByCss('a[href="/docs/"]').click()
           await retry(async () => {
             expect(await browser.elementByCss('h1').text()).toBe('Docs')

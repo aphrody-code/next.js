@@ -29,6 +29,19 @@ type OutputExportCachedResponse = {
   statusText: string
 }
 
+function getOutputExportCandidatePrefixes(pathname: string): string[] {
+  const segments = pathname.split('/').filter(Boolean)
+  const candidates: string[] = []
+
+  for (let i = segments.length; i >= 1; i--) {
+    candidates.push(segments.slice(0, i).join('/'))
+  }
+
+  candidates.push('')
+
+  return candidates
+}
+
 function getOutputExportFallbackCacheStore(): OutputExportFallbackCacheStore {
   const globalWithCache = globalThis as typeof globalThis & {
     __NEXT_OUTPUT_EXPORT_FALLBACK_CACHE_STORE?: OutputExportFallbackCacheStore
@@ -49,19 +62,6 @@ function getOutputExportFallbackCacheStore(): OutputExportFallbackCacheStore {
   }
   globalWithCache.__NEXT_OUTPUT_EXPORT_FALLBACK_CACHE_STORE = cacheStore
   return cacheStore
-}
-
-function getOutputExportCandidatePrefixes(pathname: string): string[] {
-  const segments = pathname.split('/').filter(Boolean)
-  const candidates: string[] = []
-
-  for (let i = segments.length; i >= 1; i--) {
-    candidates.push(segments.slice(0, i).join('/'))
-  }
-
-  candidates.push('')
-
-  return candidates
 }
 
 export function getOutputExportFallbackCandidates(pathname: string): string[] {
