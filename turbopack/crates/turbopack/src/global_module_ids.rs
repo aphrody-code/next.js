@@ -12,7 +12,7 @@ use turbopack_core::{
     },
     ident::AssetIdent,
     module::Module,
-    module_graph::{ModuleGraph, RefData},
+    module_graph::{GraphTraversalAction, ModuleGraph, RefData},
 };
 use turbopack_ecmascript::async_chunk::module::AsyncLoaderModule;
 
@@ -25,6 +25,12 @@ pub async fn get_global_module_id_strategy(
         let module_graph = module_graph.await?;
         let graphs = &module_graph.graphs;
 
+        let entries = graphs
+            .iter()
+            .flat_map(|g| g.entries.iter())
+            .flat_map(|e| e.entries())
+            .collect::<Vec<_>>();
+
         // All modules in the graph
         let module_idents = graphs
             .iter()
@@ -33,20 +39,24 @@ pub async fn get_global_module_id_strategy(
 
         // And additionally, all the modules that are inserted by chunking (i.e. async loaders)
         let mut async_idents = vec![];
-        module_graph.traverse_edges_unordered(|parent, current| {
-            if let Some((
-                _,
-                &RefData {
-                    chunking_type: ChunkingType::Async,
-                    ..
-                },
-            )) = parent
-            {
-                let module = ResolvedVc::try_sidecast::<Box<dyn ChunkableModule>>(current)
-                    .context("expected chunkable module for async reference")?;
-                async_idents.push(AsyncLoaderModule::asset_ident_for(*module));
+        module_graph.traverse_edges_bfs(entries, |parent, current| {
+            if let Some((_, RefData { chunking_type, .. })) = parent {
+                match chunking_type {
+                    ChunkingType::Async => {
+                        let module = ResolvedVc::try_sidecast::<Box<dyn ChunkableModule>>(current)
+                            .context("expected chunkable module for async reference")?;
+                        async_idents.push(AsyncLoaderModule::asset_ident_for(*module));
+                        return Ok(GraphTraversalAction::Continue);
+                    }
+                    ChunkingType::Traced => {
+                        // Traced modules are not loaded via an async loader module, so we can
+                        // skip them here
+                        return Ok(GraphTraversalAction::Skip);
+                    }
+                    _ => {}
+                }
             }
-            Ok(())
+            Ok(GraphTraversalAction::Continue)
         })?;
 
         let mut module_id_map = module_idents
