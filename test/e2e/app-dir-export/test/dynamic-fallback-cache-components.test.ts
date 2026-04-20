@@ -147,6 +147,34 @@ if (skipped) {
         }
       })
 
+      it('prefers deeper static-prefix fallback routes over shallower overlaps', async () => {
+        const browser = await webdriver(port, '/docs/reference/export/')
+
+        try {
+          await retry(async () => {
+            expect(await browser.elementByCss('h1').text()).toBe(
+              'reference:export'
+            )
+          })
+
+          await browser.elementByCss('a[href="/docs/"]').click()
+          await retry(async () => {
+            expect(await browser.elementByCss('h1').text()).toBe('Docs')
+          })
+
+          await browser
+            .elementByCss('a[href="/docs/reference/export/"]')
+            .click()
+          await retry(async () => {
+            expect(await browser.elementByCss('h1').text()).toBe(
+              'reference:export'
+            )
+          })
+        } finally {
+          await browser.close()
+        }
+      })
+
       it('renders optional catch-all fallback routes for empty and nested params', async () => {
         const browser = await webdriver(port, '/optional/')
 

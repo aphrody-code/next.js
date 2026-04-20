@@ -129,6 +129,7 @@ describe('output export fallback helpers', () => {
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
       'https://example.com/docs/guides/export/__fallback.meta.json',
       'https://example.com/docs/guides/export/__fallback.txt',
+      'https://example.com/docs/guides/export/__fallback/index.txt',
       'https://example.com/docs/guides/__fallback.meta.json',
       'https://example.com/docs/guides/__fallback.txt',
     ])
