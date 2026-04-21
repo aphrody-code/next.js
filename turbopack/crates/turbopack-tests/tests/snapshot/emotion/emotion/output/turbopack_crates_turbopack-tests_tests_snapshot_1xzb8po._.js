@@ -50,8 +50,6 @@ function jsx() {
 }),
 "[project]/turbopack/crates/turbopack-tests/tests/snapshot/node_modules/@emotion/styled/index.js [test] (ecmascript)", ((__turbopack_context__, module, exports) => {
 
-"purposefully empty stub";
-"@emtion/styled/index.js";
 }),
 ]);
 

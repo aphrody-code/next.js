@@ -16,8 +16,7 @@ __turbopack_context__.s([
     "SOME_VALUE",
     ()=>SOME_VALUE
 ]);
-'use turbopack: constants';
-const SOME_VALUE = 'x';
+export const SOME_VALUE = 'x';
 const NO_CONSTANT = globalThis.foo;
 const LONG_STRING = 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789';
 const LONG_NUMBER = 21345672345678345678901234567890;

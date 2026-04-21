@@ -1816,6 +1816,10 @@ async fn process_parse_result(
                 trailing: Default::default(),
             };
 
+            // Remove directives before running codegens that might prepend code before the
+            // directives.
+            remove_directives(&mut program);
+
             process_content_with_code_gens(&mut program, globals, &mut code_gens);
 
             for comments in code_gens.iter_mut().flat_map(|cg| cg.comments.as_mut()) {
@@ -1863,7 +1867,6 @@ async fn process_parse_result(
                 // we need to remove any shebang before bundling as it's only valid as the first
                 // line in a js file (not in a chunk item wrapped in the runtime)
                 remove_shebang(&mut program);
-                remove_directives(&mut program);
             });
 
             Ok(CodeGenResult {

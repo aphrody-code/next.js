@@ -15,8 +15,6 @@ console.log(MyButton);
 }),
 "[project]/turbopack/crates/turbopack-tests/tests/snapshot/node_modules/styled-components/index.js [test] (ecmascript)", ((__turbopack_context__, module, exports) => {
 
-"purposefully empty stub";
-"styled-components/index.js";
 }),
 ]);
 
