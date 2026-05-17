@@ -145,7 +145,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: mmastrac/mmm-matrix@3edd85c30addba11887c770740309c979a446aa9 # v1
+      - uses: mmastrac/mmm-matrix@ce9af9407722d4d9c65475a39e89b29427ca79cb # v1
         id: matrix
         with:
           config: |
