@@ -32,7 +32,7 @@ jobs:
     name: Benchmark Rust Crates (small apps)
     runs-on: ['self-hosted', 'linux', 'x64', 'metal']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -67,7 +67,7 @@ jobs:
     name: Benchmark Rust Crates (analyzer)
     runs-on: ['self-hosted', 'linux', 'x64', 'metal']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -103,7 +103,7 @@ jobs:
     if: ${{ github.event.label.name == 'benchmark' || github.event_name == 'workflow_dispatch' }}
     runs-on: ['self-hosted', 'linux', 'x64', 'metal']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust

@@ -54,13 +54,13 @@ jobs:
         run: echo "Checking out Next.js ${{ env.NEXTJS_VERSION }}"
 
       - name: Checkout Next.js
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: vercel/next.js
           ref: ${{ env.NEXTJS_VERSION }}
 
       - name: Checkout failed test lists
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: vercel/turbo
           ref: nextjs-integration-test-data
