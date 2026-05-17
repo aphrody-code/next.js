@@ -79,8 +79,8 @@ interface PackageFiles {
 
 async function main(): Promise<void> {
   if (cliOptions.jsBuild) {
-    exec('Install Next.js build dependencies', 'pnpm i')
-    exec('Build Next.js', 'pnpm run build')
+    exec('Install Next.js build dependencies', 'bun install')
+    exec('Build Next.js', 'bun run build')
   }
 
   if (cliOptions.tar && cliOptions.compress !== 'strip') {

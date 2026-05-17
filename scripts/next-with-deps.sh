@@ -29,11 +29,13 @@ done
 
 if [ ! -z $HAS_CONFLICTING_DEP ] || [ ! -d "$PROJECT_DIR/node_modules" ];then
   cd $PROJECT_DIR
-  pnpm i --ignore-workspace --no-lockfile
-  for dep in ${CONFLICTING_DEPS[@]};do 
+  # `bun install` ignores the workspace root if invoked from inside a non-workspace dir.
+  # We install with `--no-save` to skip lockfile churn (same intent as pnpm --no-lockfile).
+  bun install --no-save
+  for dep in ${CONFLICTING_DEPS[@]};do
     rm -rf node_modules/$dep
   done
 fi
 
 cd $START_DIR
-pnpm next $@
+bun next $@

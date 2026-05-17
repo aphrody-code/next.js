@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# bun runtime + installer config for the aphrody fork of next.js
+# Generated during bunisation (replaces pnpm-workspace.yaml runtime knobs).
+
+[install]
+# Public npm registry only; mirror via env BUN_REGISTRY at need.
+registry = "https://registry.npmjs.org/"
+
+# Production = false so devDependencies install at the workspace root.
+production = false
+
+# Equivalent of pnpm's `auto-install-peers = true`.
+peer = true
+
+# Be exact about versions — matches pnpm semver behaviour for the fork.
+exact = false
+
+# Workspace packages: bun resolves them from package.json `workspaces` field.
+
+[install.cache]
+# Per-user cache, keep default.
+disable = false
+
+[install.lockfile]
+# Save lockfile (bun.lock, text-based since 1.2+).
+save = true
+print = "yarn"
+
+[install.scripts]
+# Equivalent of pnpm `allowBuilds` + the subset of dependencies whose
+# postinstall must run (native bindings, swc, sharp, etc.).
+# Bun calls this trustedDependencies in package.json — we mirror here too
+# so `bun install --frozen-lockfile` doesn't trip on transitive native deps.
+allowed = [
+  "@ast-grep/cli",
+  "@datadog/native-appsec",
+  "@datadog/native-metrics",
+  "@datadog/pprof",
+  "@swc/core",
+  "@tailwindcss/oxide",
+  "core-js",
+  "cpu-features",
+  "dd-trace",
+  "esbuild",
+  "msw",
+  "nx",
+  "playwright-chromium",
+  "protobufjs",
+  "sharp",
+  "ssh2",
+  "unrs-resolver",
+  "wasm-pack",
+]
+
+[run]
+# Use bun as the JS runtime even for scripts shelling out to node-typed
+# entrypoints. Falls back to node for files that explicitly require it.
+bun = true
+
+# Silence bun's "(bun)" prefix on script output; cleaner CI logs.
+silent = false

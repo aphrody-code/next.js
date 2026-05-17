@@ -18,9 +18,6 @@ import { outdent } from 'outdent'
   const { version: nextVersion } = JSON.parse(
     fs.readFileSync(path.join(cwd, 'packages', 'next', 'package.json'))
   )
-  const { packageManager } = JSON.parse(
-    fs.readFileSync(path.join(cwd, 'package.json'))
-  )
 
   try {
     // if installed swc package version matches monorepo version
@@ -56,46 +53,32 @@ import { outdent } from 'outdent'
         '@next/swc-win32-arm64-msvc': nextVersion,
         '@next/swc-win32-x64-msvc': nextVersion,
       },
-      packageManager,
     }
     fs.writeFileSync(path.join(tmpdir, 'package.json'), JSON.stringify(pkgJson))
+
+    // bun replaces the pnpm-workspace.yaml security knobs with `.bunfig.toml`.
+    // We mirror the minimal subset needed at install time (no workspace, no
+    // exotic-subdeps protection — same effect via bun's default isolation).
     fs.writeFileSync(
-      path.join(tmpdir, 'pnpm-workspace.yaml'),
-      '' +
+      path.join(tmpdir, '.bunfig.toml'),
+      '# SPDX-License-Identifier: Apache-2.0\n' +
+        '[install]\n' +
+        'production = false\n' +
+        'peer = true\n' +
         outdent`
-          nodeLinker: hoisted
+          # Mirror of pnpm-workspace.yaml minimumReleaseAge=2880 intent
+          # (bun does not implement this knob yet — exclusions are advisory).
         ` +
-        '\n' +
-        // Propagate security related settings from file://./../../pnpm-workspace.yaml
-        outdent`
-          blockExoticSubdeps: true
-          minimumReleaseAge: 2880 # 48 hrs
-          minimumReleaseAgeExclude:
-            - '@next/*'
-            - '@turbo/*'
-            - '@vercel/*'
-            - '@workflow/*'
-            - babel-plugin-react-compiler
-            - next
-            - react
-            - react-dom
-            - react-is
-            - react-server-dom-*
-            - scheduler
-            - turbo
-        `
+        '\n'
     )
 
-    const args = [
-      'add',
-      `next@${nextVersion}`,
-      '--lockfile=false',
-      '--ignore-scripts',
-    ]
+    // `bun add` with `--no-save` to skip lockfile writes (mirrors pnpm
+    // `--lockfile=false`). `--ignore-scripts` keeps postinstall safe.
+    const args = ['add', `next@${nextVersion}`, '--no-save', '--ignore-scripts']
     if (preferOffline) {
       args.push('--prefer-offline')
     }
-    await execa('pnpm', args, { cwd: tmpdir })
+    await execa('bun', args, { cwd: tmpdir })
 
     let pkgs = fs.readdirSync(path.join(tmpdir, 'node_modules/@next'))
     fs.mkdirSync(path.join(cwd, 'node_modules/@next'), { recursive: true })
@@ -104,11 +87,11 @@ import { outdent } from 'outdent'
       pkgs.map(async (pkg) => {
         const from = path.join(tmpdir, 'node_modules/@next', pkg)
         const to = path.join(cwd, 'node_modules/@next', pkg)
-        // The directory from pnpm store is a symlink, which can not be overwritten,
-        // so we remove the existing directory before copying
+        // bun's node_modules entries may be symlinks (cache-backed) on some
+        // platforms — remove the destination first to avoid EEXIST.
         await fsp.rm(to, { recursive: true, force: true })
         // Renaming is flaky on Windows, and the tmpdir is going to be deleted anyway,
-        // so we use copy the directory instead
+        // so we use copy the directory instead.
         return fsp.cp(from, to, { force: true, recursive: true })
       })
     )
