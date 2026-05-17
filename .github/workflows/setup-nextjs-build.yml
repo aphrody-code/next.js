@@ -34,7 +34,7 @@ jobs:
         id: cpu-cores
 
       - name: 'Setup Rust toolchain'
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
 
       - name: Display runner information
         run: echo runner cpu count ${{ steps.cpu-cores.outputs.count }}
